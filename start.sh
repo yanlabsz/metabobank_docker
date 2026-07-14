@@ -1,9 +1,9 @@
 #!/bin/bash
 
-wget https://www.metabobank.cn/docker_download/metabobank/outmongo.tar.gz
-wget https://www.metabobank.cn/docker_download/metabobank/nsmetabobank.tar.gz
-wget https://www.metabobank.cn/docker_download/metabobank/mongod.tar.gz
-wget https://www.metabobank.cn/docker_download/metabobank/omics.tar.gz
+wget -c https://www.metabobank.cn/docker_download/outmongo.tar.gz
+wget -c https://www.metabobank.cn/docker_download/nsmetabobank.tar.gz
+wget -c https://www.metabobank.cn/docker_download/mongod.tar.gz
+wget -c https://www.metabobank.cn/docker_download/omics.tar.gz
 
 tar -xzvf data1.tar.gz -C /
 chmod -R 777 /data1
