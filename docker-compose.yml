@@ -1,11 +1,12 @@
 # Metabobank Client v3.0 - 用户部署版
 # 由 start.sh 自动下载生成，也可手动 docker compose up -d
 #
-# 环境变量（由 start.sh 写入 .env，也可手动改）：
-#   METABOBANK_PORT      Web 主程序端口（默认 8090）
-#   METABOBANK_DB_PORT   MongoDB 端口（默认 27023）
-#   METABOBANK_RSERVE_PORT  Rserve 端口（默认 6322，仅容器内）
-#   METABOBANK_DATA      数据目录（默认 ./metabobank_data）
+# 数据：MongoDB 5.0，首次部署自动创建空库（无认证），可选下载预置数据快照
+# 环境变量（start.sh 自动写入 .env，也可手动覆盖）：
+#   METABOBANK_PORT        Web 主程序端口（默认 8090）
+#   METABOBANK_DB_PORT     MongoDB 端口（默认 27023）
+#   METABOBANK_RSERVE_PORT Rserve 端口（默认 6322）
+#   METABOBANK_DATA        数据目录（默认 ./metabobank_data）
 
 services:
   metabospark:
@@ -16,8 +17,14 @@ services:
       - "${METABOBANK_PORT:-8090}:8090"
     environment:
       TZ: Asia/Shanghai
+      # 容器内通过 docker 网络访问 mongo（服务名 mongodb5_client）
       METABOBANK_DB_HOST: mongodb5_client
       METABOBANK_DB_PORT: "27023"
+      # 留空 = 无认证（用户端默认空目录部署不带 auth）
+      METABOBANK_DB_USER: ""
+      METABOBANK_DB_PASS: ""
+      METABOBANK_DB_AUTH: "admin"
+      # Rserve（组学分析）
       MB_RSERVE_HOST: rserve
       MB_RSERVE_PORT: "6322"
       MB_RSERVE_CONNECT_TIMEOUT: "10"
@@ -40,12 +47,14 @@ services:
     image: mongo:5.0
     container_name: mongodb5_client
     restart: unless-stopped
-    user: "0:0"
+    # user: "0:0"  # 需要挂载宿主机已有 WiredTiger 数据时取消注释（属主 root）
     ports:
       - "${METABOBANK_DB_PORT:-27023}:27023"
+    # 无认证模式（首次部署自动创建空库，data 目录已有 auth 用户文件时 mongo 会拒绝启动）
     command: ["mongod", "--dbpath", "/data/db", "--port", "27023", "--bind_ip_all"]
     volumes:
-      - "${METABOBANK_DATA:-./metabobank_data}/db:/data/db"
+      # mongodb5_data.tar.gz 解压后顶层就是 dbs/，直接挂进来
+      - "${METABOBANK_DATA:-./metabobank_data}/dbs:/data/db"
     healthcheck:
       test: ["CMD-SHELL", "mongosh --quiet --port 27023 --eval 'db.adminCommand({ping:1})' || mongo --quiet --port 27023 --eval 'db.adminCommand({ping:1})' || exit 1"]
       interval: 30s
