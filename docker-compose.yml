@@ -1,44 +1,72 @@
-version: "3.3"
+# Metabobank Client v3.0 - 用户部署版
+# 由 start.sh 自动下载生成，也可手动 docker compose up -d
+#
+# 环境变量（由 start.sh 写入 .env，也可手动改）：
+#   METABOBANK_PORT      Web 主程序端口（默认 8090）
+#   METABOBANK_DB_PORT   MongoDB 端口（默认 27023）
+#   METABOBANK_RSERVE_PORT  Rserve 端口（默认 6322，仅容器内）
+#   METABOBANK_DATA      数据目录（默认 ./metabobank_data）
+
 services:
-  omics:
-    image: omics_r43:v2.0
+  metabospark:
+    image: metabank/metabospark:v3.0
+    container_name: metabospark
+    restart: unless-stopped
     ports:
-       - 6322:6322
-    volumes:
-       - /data1:/data1
-    networks:
-      meta_net:
-        ipv4_address: 172.16.1.4
-  web:
-    image: smetabobank:v2.1
-    ports:
-       - 8085:8088
-    volumes:
-       - /metabobank_data:/metabobank_data
-       - /data1:/data1
+      - "${METABOBANK_PORT:-8090}:8090"
     environment:
-       - TZ=Asia/Shanghai
-    command: /start.sh
-    networks:
-      meta_net:
-        ipv4_address: 172.16.1.2
-  mongodb:
-    image: mongod:v3.6
-    ports:
-       - 27027:27027
-    environment:
-       - TZ=Asia/Shanghai
-    command: /mongodb/bin/mongod_client_free --config /mongodb/conf/mongodb.conf
+      TZ: Asia/Shanghai
+      METABOBANK_DB_HOST: mongodb5_client
+      METABOBANK_DB_PORT: "27023"
+      MB_RSERVE_HOST: rserve
+      MB_RSERVE_PORT: "6322"
+      MB_RSERVE_CONNECT_TIMEOUT: "10"
+      MB_RSERVE_EVAL_TIMEOUT: "1800"
     volumes:
-       - /mongodb/conf:/mongodb/conf
-       - /mongodb/dbs:/mongodb/dbs
-       - /mongodb/logs:/mongodb/logs
+      - "${METABOBANK_DATA:-./metabobank_data}:/metabobank_data"
+    depends_on:
+      - mongodb5_client
+      - rserve
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8090/login || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
     networks:
-      meta_net:
-        ipv4_address: 172.16.1.3 
+      - metabobank
+
+  mongodb5_client:
+    image: mongo:5.0
+    container_name: mongodb5_client
+    restart: unless-stopped
+    user: "0:0"
+    ports:
+      - "${METABOBANK_DB_PORT:-27023}:27023"
+    command: ["mongod", "--dbpath", "/data/db", "--port", "27023", "--bind_ip_all"]
+    volumes:
+      - "${METABOBANK_DATA:-./metabobank_data}/db:/data/db"
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --port 27023 --eval 'db.adminCommand({ping:1})' || mongo --quiet --port 27023 --eval 'db.adminCommand({ping:1})' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - metabobank
+
+  rserve:
+    image: metabank/metabospark-omics:v3.0
+    container_name: metabospark_rserve
+    restart: unless-stopped
+    expose:
+      - "6322"
+      - "6311"
+    volumes:
+      - "${METABOBANK_DATA:-./metabobank_data}:/metabobank_data"
+    networks:
+      - metabobank
+
 networks:
-  meta_net:
-    ipam:
-      driver: default
-      config:
-        - subnet: "172.16.1.0/24"
+  metabobank:
+    driver: bridge
