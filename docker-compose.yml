@@ -1,4 +1,4 @@
-# Metabobank Client v3.2 - 用户部署版
+# Metabobank Client - 用户部署版
 # 由 start.sh 自动下载生成，也可手动 docker compose up -d
 #
 # 注意：本文件刻意不写 container_name，容器名由 compose 自动生成为
@@ -7,8 +7,8 @@
 #
 # 环境变量（由 start.sh 写入 .env，也可手动改）：
 #   METABOBANK_PORT      Web 主程序端口（默认 8090）
-#   METABOBANK_DB_PORT   MongoDB 对外映射端口（默认 27023，容器内固定 27023）
-#   METABOBANK_RSERVE_PORT  Rserve 对外端口（默认 6322，容器内固定 6322）
+#   METABOBANK_DB_PORT   MongoDB 对外映射端口（默认 27023）
+#   METABOBANK_RSERVE_PORT  Rserve 对外端口（默认 6322）
 #   METABOBANK_DATA      数据目录（默认 ./metabobank_data，内含 dbs/）
 
 services:
@@ -19,13 +19,16 @@ services:
       - "${METABOBANK_PORT:-8090}:8090"
     environment:
       TZ: Asia/Shanghai
+      # 容器内通过服务名访问 MongoDB，覆盖 .env 里的 127.0.0.1
       METABOBANK_DB_HOST: mongodb5_client
       METABOBANK_DB_PORT: "27023"
+      # 组学分析 Rserve（旧镜像实际监听 6322）
       MB_RSERVE_HOST: rserve
       MB_RSERVE_PORT: "6322"
       MB_RSERVE_CONNECT_TIMEOUT: "10"
       MB_RSERVE_EVAL_TIMEOUT: "1800"
     volumes:
+      # 上传样本、解析结果、导出文件（代码中 rootPath=/metabobank_data）
       - "${METABOBANK_DATA:-./metabobank_data}:/metabobank_data"
     depends_on:
       - mongodb5_client
@@ -41,7 +44,7 @@ services:
 
   mongodb5_client:
     # 一体化镜像：内置 mongod5_client 二进制 + 配置 + 预置质谱数据快照
-    # 首次启动若挂载的 dbs 为空，entrypoint 自动从镜像内置快照复制初始化数据
+    # 生产环境直接挂载宿主机已有数据目录，entrypoint 检测非空则不覆盖
     image: metabank/mongodb5_client:v3.0
     restart: unless-stopped
     user: "0:0"
@@ -61,9 +64,12 @@ services:
   rserve:
     image: metabank/metabospark-omics:v3.0
     restart: unless-stopped
+    # 只给 metabospark 内部访问，不占用宿主机端口
+    # 6322 为 Rserve 实际监听端口（与旧镜像 omics_r43:v2.0 / Dockerfile_omics 一致）
     expose:
       - "6322"
       - "6311"
+    # 与 metabospark 共享数据卷，R 脚本的 setwd / Read.TextData 才能读到 CSV、写回 PNG
     volumes:
       - "${METABOBANK_DATA:-./metabobank_data}:/metabobank_data"
     networks:
