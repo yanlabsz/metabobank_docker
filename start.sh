@@ -1,31 +1,31 @@
 #!/bin/bash
 # ============================================================================
-# Metabobank Client - 一键部署脚本 (v3.2)
+# Metabobank Client - one-click deployment (v3.3)
 # ============================================================================
-# 用法：
-#   bash start.sh                  # 安装并启动（已有容器则复用，不重建）
-#   bash start.sh --with-data      # 安装并下载预置 MongoDB 数据快照（约 7.4GB）
-#   bash start.sh --force          # 强制重建（先 down 再 up，容器会被替换）
-#   bash start.sh --only-start     # 只启动（镜像已 docker load 过）
-#   bash start.sh --stop           # 停止并移除本项目的容器
-#   bash start.sh --restart        # 重启本项目服务
+# Usage:
+#   bash start.sh                install & start (reuse if already installed)
+#   bash start.sh --with-data    also download MongoDB data snapshot (~7.4G)
+#   bash start.sh --force        recreate containers (down then up)
+#   bash start.sh --only-start   start only (images already loaded)
+#   bash start.sh --stop         stop and remove this project's containers
+#   bash start.sh --restart      restart this project
 #
-# 安全机制：
-#   1. flock 单实例锁，防止脚本并发/重复执行
-#   2. 容器归属检测：发现同名容器属于其他 compose 项目时拒绝操作，避免误删
-#   3. 已有容器复用：配置不变时 compose up -d 幂等，不会重复创建容器
+# Safety:
+#   * flock single-instance lock (no concurrent / duplicated execution)
+#   * compose project name derived from directory (or METABOBANK_PROJECT)
+#   * no container_name in docker-compose.yml => never collides with an
+#     existing Metabobank installation on the same host
+#   * port conflict check with clear hint to override via env vars
 # ============================================================================
 set -e
 
-# --- 单实例锁 ---------------------------------------------------------------
 LOCK_FILE="/tmp/metabobank_start.lock"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-    echo "[ERROR] 另一个 start.sh 实例正在运行，本次退出"
+    echo "[ERROR] another start.sh instance is running, aborting"
     exit 1
 fi
 
-# --- 基本配置 ---------------------------------------------------------------
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
@@ -33,11 +33,7 @@ DOWNLOAD_SOURCES=(
     "https://raw.githubusercontent.com/yanlabsz/metabobank_docker/main"
     "https://www.metabobank.cn/docker_download"
 )
-IMAGE_FILES=(
-    "metabospark.tar.gz"
-    "mongodb5.tar.gz"
-    "omics.tar.gz"
-)
+IMAGE_FILES=("metabospark.tar.gz" "mongodb5.tar.gz" "omics.tar.gz")
 DATA_FILE="mongodb5_data.tar.gz"
 COMPOSE_REMOTE="docker-compose.yml"
 
@@ -45,88 +41,56 @@ DATA_DIR="${METABOBANK_DATA_DIR:-$APP_DIR/metabobank_data}"
 META_PORT="${METABOBANK_PORT:-8090}"
 MONGO_PORT="${METABOBANK_MONGO_PORT:-27023}"
 RSERVE_PORT="${METABOBANK_RSERVE_PORT:-6322}"
+PROJECT_NAME="${METABOBANK_PROJECT:-$(basename "$APP_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')}"
 
-CONTAINERS=("metabospark" "mongodb5_client" "metabospark_rserve")
-
-# --- 颜色输出 ---------------------------------------------------------------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
-# --- 工具函数 ---------------------------------------------------------------
-container_exists() {
-    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$1"
+# --- helpers ---------------------------------------------------------------
+port_busy() {
+    ss -lnt 2>/dev/null | awk 'NR>1{print $4}' | grep -qE "[:.]$1$"
 }
 
-container_running() {
-    docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$1"
+project_containers() {
+    docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" \
+        --format '{{.Names}}' 2>/dev/null || true
 }
 
-# 容器属于哪个 compose 项目（无标签返回空）
-container_project() {
-    docker inspect "$1" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true
-}
-
-# 当前目录对应的默认 compose 项目名（compose 规则：目录名小写、去非法字符）
-current_project() {
-    basename "$APP_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g'
-}
-
-# --- 前置检查 ---------------------------------------------------------------
+# --- preflight -------------------------------------------------------------
 check_prereqs() {
-    info "检查运行环境..."
-    command -v docker >/dev/null 2>&1 || error "未检测到 docker，请先安装 Docker 20+"
-    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || error "未检测到 curl 或 wget"
+    info "checking environment..."
+    command -v docker >/dev/null 2>&1 || error "docker not found, please install Docker 20+"
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || error "curl or wget required"
 
     if docker compose version >/dev/null 2>&1; then
         COMPOSE_CMD="docker compose"
     elif command -v docker-compose >/dev/null 2>&1; then
         COMPOSE_CMD="docker-compose"
     else
-        error "未检测到 docker compose v2 或 docker-compose"
+        error "docker compose (v2) or docker-compose not found"
     fi
     info "OK: $COMPOSE_CMD"
 }
 
-# --- 容器归属检测（核心保护）------------------------------------------------
-# 返回：
-#   0 = 干净，可以全新安装（没有任何目标容器）
-#   2 = 目标容器已存在且属于本项目 → 复用
-#   1 = 发现属于其他项目的同名容器 → 拒绝（除非 --force）
-check_existing() {
-    local cur_proj foreign="" mine=0 total=0
-    cur_proj=$(current_project)
-
-    for c in "${CONTAINERS[@]}"; do
-        if container_exists "$c"; then
-            total=$((total+1))
-            local proj
-            proj=$(container_project "$c")
-            if [ -n "$proj" ] && [ "$proj" != "$cur_proj" ]; then
-                foreign="$foreign $c($proj)"
-            else
-                mine=$((mine+1))
-            fi
+check_ports() {
+    local p busy=0
+    for p in "$META_PORT" "$MONGO_PORT"; do
+        if port_busy "$p"; then
+            warn "port $p is already in use"
+            busy=1
         fi
     done
-
-    if [ -n "$foreign" ]; then
-        warn "检测到以下同名容器属于其他 compose 项目："
-        for f in $foreign; do warn "  - $f"; done
-        warn "当前目录项目名为: $cur_proj"
-        warn "继续操作会删除并重建这些容器，可能导致其数据目录被替换！"
-        return 1
+    if [ "$busy" -eq 1 ]; then
+        warn "another service (maybe an existing Metabobank) is using these ports."
+        warn "choose different ports, for example:"
+        warn "  METABOBANK_PORT=18090 METABOBANK_MONGO_PORT=37023 bash start.sh"
+        error "port conflict, aborted"
     fi
-
-    if [ "$total" -gt 0 ]; then
-        info "检测到 $total 个已存在的本项目容器，将复用（不重新下载镜像）"
-        return 2
-    fi
-    return 0
 }
 
-# --- 下载工具 ---------------------------------------------------------------
+# --- download --------------------------------------------------------------
 fetch() {
     local url="$1" out="$2"
     if command -v curl >/dev/null 2>&1; then
@@ -137,10 +101,9 @@ fetch() {
 }
 
 probe_source() {
-    local src test_url
+    local src
     for src in "${DOWNLOAD_SOURCES[@]}"; do
-        test_url="$src/${IMAGE_FILES[0]}"
-        if fetch "$test_url" "$APP_DIR/.probe_tmp" 2>/dev/null; then
+        if fetch "$src/${IMAGE_FILES[0]}" "$APP_DIR/.probe_tmp" 2>/dev/null; then
             rm -f "$APP_DIR/.probe_tmp"
             echo "$src"
             return 0
@@ -151,70 +114,70 @@ probe_source() {
 
 download_all() {
     local src="$1" with_data="${2:-no}"
-    info "使用下载源: $src"
+    info "download source: $src"
 
-    info "下载 $COMPOSE_REMOTE ..."
-    fetch "$src/$COMPOSE_REMOTE" "$COMPOSE_FILE" || error "下载 $COMPOSE_REMOTE 失败"
+    info "downloading $COMPOSE_REMOTE ..."
+    fetch "$src/$COMPOSE_REMOTE" "$COMPOSE_FILE" || error "failed to download $COMPOSE_REMOTE"
 
     local f
     for f in "${IMAGE_FILES[@]}"; do
         if [ -s "$APP_DIR/$f" ]; then
-            info "已存在 $f，跳过下载"
+            info "$f already exists, skip"
             continue
         fi
-        info "下载 $f （较大，请耐心等待）..."
-        fetch "$src/$f" "$APP_DIR/$f" || error "下载 $f 失败"
+        info "downloading $f (large file, please wait)..."
+        fetch "$src/$f" "$APP_DIR/$f" || error "failed to download $f"
     done
 
     if [ "$with_data" = "yes" ]; then
         if [ -s "$APP_DIR/$DATA_FILE" ]; then
-            info "已存在 $DATA_FILE，跳过下载"
+            info "$DATA_FILE already exists, skip"
         else
-            info "下载预置数据快照 $DATA_FILE（约 7.4GB）..."
+            info "downloading data snapshot $DATA_FILE (~7.4GB)..."
             fetch "$src/$DATA_FILE" "$APP_DIR/$DATA_FILE" || {
-                warn "数据快照下载失败，将使用空库启动"
+                warn "data snapshot download failed, will start with an empty database"
                 rm -f "$APP_DIR/$DATA_FILE"
             }
         fi
     fi
-    info "文件下载完成"
+    info "download finished"
 }
 
 load_images() {
-    local f
+    local f tmp
     for f in "${IMAGE_FILES[@]}"; do
         [ ! -s "$APP_DIR/$f" ] && continue
-        info "加载镜像: $f"
+        info "loading image: $f"
         if ! docker load -i "$APP_DIR/$f" 2>/dev/null; then
-            local tmp="${f%.gz}"
+            tmp="${f%.gz}"
             gunzip -c "$APP_DIR/$f" > "$APP_DIR/$tmp"
             docker load -i "$APP_DIR/$tmp"
             rm -f "$APP_DIR/$tmp"
         fi
     done
-    info "镜像加载完成"
+    info "images loaded"
     docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' | grep -E 'metabank|^mongo:5' || true
 }
 
-# --- 准备数据目录 -----------------------------------------------------------
+# --- data dir --------------------------------------------------------------
 prepare_data_dir() {
-    info "准备数据目录: $DATA_DIR"
+    info "preparing data directory: $DATA_DIR"
     mkdir -p "$DATA_DIR/csv_upload" "$DATA_DIR/spectrum_upload" \
              "$DATA_DIR/sample_upload" "$DATA_DIR/single_upload" \
              "$DATA_DIR/tools_upload" "$DATA_DIR/download" \
              "$DATA_DIR/compound_catche"
 
     if [ -s "$APP_DIR/$DATA_FILE" ]; then
-        if [ -d "$DATA_DIR/dbs" ] && [ "$(ls -A "$DATA_DIR/dbs" 2>/dev/null)" ]; then
-            warn "$DATA_DIR/dbs 已有数据，跳过解压"
+        if [ -d "$DATA_DIR/dbs" ] && [ -n "$(ls -A "$DATA_DIR/dbs" 2>/dev/null)" ]; then
+            warn "$DATA_DIR/dbs already has data, skip extraction"
         else
-            info "解压数据快照到 $DATA_DIR ..."
+            info "extracting data snapshot to $DATA_DIR ..."
             tar xzf "$APP_DIR/$DATA_FILE" -C "$DATA_DIR"
-            info "数据解压完成"
+            info "data extracted"
         fi
     else
         mkdir -p "$DATA_DIR/dbs"
-        warn "无数据快照，以空库启动（可用 --with-data 重新安装获取数据）"
+        warn "no data snapshot, starting with an empty database"
     fi
 
     cat > "$APP_DIR/.env" <<ENVEOF
@@ -223,36 +186,39 @@ METABOBANK_DB_PORT=$MONGO_PORT
 METABOBANK_PORT=$META_PORT
 METABOBANK_RSERVE_PORT=$RSERVE_PORT
 ENVEOF
-    info ".env 已生成"
+    info ".env written"
 }
 
-# --- 启动/停止 --------------------------------------------------------------
+# --- start / stop ----------------------------------------------------------
+compose() { $COMPOSE_CMD -f "$COMPOSE_FILE" -p "$PROJECT_NAME" "$@"; }
+
 do_start() {
-    info "启动 Metabobank 服务..."
-    $COMPOSE_CMD -f "$COMPOSE_FILE" up -d
+    info "starting services (project: $PROJECT_NAME)..."
+    compose up -d
     echo ""
-    info "等待服务就绪（约 15 秒）..."
+    info "waiting for services to become ready (~15s)..."
     sleep 15
-    $COMPOSE_CMD -f "$COMPOSE_FILE" ps
+    compose ps
     echo ""
     local ip
     ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     [ -z "$ip" ] && ip="127.0.0.1"
     info "=============================================="
-    info "  访问地址: http://$ip:$META_PORT"
-    info "  数据目录: $DATA_DIR"
-    info "  MongoDB:  $ip:$MONGO_PORT"
+    info "  URL:        http://$ip:$META_PORT"
+    info "  data dir:   $DATA_DIR"
+    info "  MongoDB:    $ip:$MONGO_PORT"
+    info "  project:    $PROJECT_NAME"
     info "=============================================="
 }
 
 do_stop() {
-    info "停止本项目 Metabobank 服务..."
-    [ -f "$COMPOSE_FILE" ] || error "未找到 $COMPOSE_FILE"
-    $COMPOSE_CMD -f "$COMPOSE_FILE" down
-    info "已停止"
+    info "stopping services (project: $PROJECT_NAME)..."
+    [ -f "$COMPOSE_FILE" ] || error "$COMPOSE_FILE not found"
+    compose down
+    info "stopped"
 }
 
-# --- 主流程 -----------------------------------------------------------------
+# --- main ------------------------------------------------------------------
 main() {
     local mode="install" with_data="no" force="no"
     for arg in "$@"; do
@@ -260,23 +226,16 @@ main() {
             --with-data) with_data="yes" ;;
             --force)     force="yes" ;;
             --only-start|--stop|--restart) mode="$arg" ;;
-            install)     mode="install" ;;
-            *) echo "用法: bash start.sh [--with-data] [--force] [--only-start|--stop|--restart]"; exit 1 ;;
+            *) echo "usage: bash start.sh [--with-data] [--force] [--only-start|--stop|--restart]"; exit 1 ;;
         esac
     done
 
     check_prereqs
 
-    # 容器归属检测：任何模式下都先做保护
-    local exist_rc=0
-    check_existing || exist_rc=$?
-
-    if [ "$exist_rc" -eq 1 ]; then
-        if [ "$force" != "yes" ]; then
-            error "因存在其他项目的同名容器，已中止。确认要替换请加 --force，或先手动 docker rm 这些容器"
-        fi
-        warn "--force 已指定，将强制重建这些容器"
-    fi
+    local mine
+    mine=$(project_containers)
+    local has_mine=0
+    [ -n "$mine" ] && has_mine=1
 
     case "$mode" in
         --stop)
@@ -288,22 +247,24 @@ main() {
             do_start
             ;;
         --only-start)
-            [ -f "$COMPOSE_FILE" ] || error "--only-start 需要先有 docker-compose.yml"
+            [ -f "$COMPOSE_FILE" ] || error "--only-start needs docker-compose.yml"
             prepare_data_dir
             do_start
             ;;
         install)
-            if [ "$force" = "yes" ] && [ -f "$COMPOSE_FILE" ]; then
-                do_stop
-            fi
-            if [ "$exist_rc" -eq 2 ]; then
-                # 复用：跳过下载和 load
-                info "复用已存在容器，直接启动"
+            if [ "$has_mine" -eq 1 ]; then
+                info "found existing containers of project '$PROJECT_NAME':"
+                echo "$mine" | while read -r c; do [ -n "$c" ] && info "  - $c"; done
+                info "reusing them (no download, no image load)"
                 prepare_data_dir
                 do_start
             else
+                check_ports
+                if [ "$force" = "yes" ] && [ -f "$COMPOSE_FILE" ]; then
+                    do_stop
+                fi
                 local src
-                src=$(probe_source) || error "无法连通 GitHub 和官网下载源，请检查网络"
+                src=$(probe_source) || error "cannot reach GitHub or the official download site"
                 download_all "$src" "$with_data"
                 load_images
                 prepare_data_dir
