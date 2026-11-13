@@ -1,5 +1,5 @@
-# Metabobank Client - 用户部署版
-# 由 start.sh 自动下载生成，也可手动 docker compose up -d
+# Metabobank Client - 用户部署版（v3.0 结构，与 https://www.metabobank.cn/docker_download 一致）
+# 由 start.sh 自动下载/校验，也可手动 docker compose up -d
 #
 # 注意：本文件刻意不写 container_name，容器名由 compose 自动生成为
 #       <目录名>-metabospark-1 形式，因此可以在已有 Metabobank 生产环境的
@@ -8,9 +8,8 @@
 # 环境变量（由 start.sh 写入 .env，也可手动改）：
 #   METABOBANK_PORT      Web 主程序端口（默认 8090）
 #   METABOBANK_DB_PORT   MongoDB 对外映射端口（默认 27023）
-#   METABOBANK_RSERVE_PORT  Rserve 对外端口（默认 6322）
+#   METABOBANK_RSERVE_PORT  Rserve 对外端口（默认 6322，仅容器内）
 #   METABOBANK_DATA      数据目录（默认 ./metabobank_data，内含 dbs/）
-
 services:
   metabospark:
     image: metabank/metabospark:v3.0
@@ -41,7 +40,6 @@ services:
       start_period: 40s
     networks:
       - metabobank
-
   mongodb5_client:
     # 一体化镜像：内置 mongod5_client 二进制 + 配置 + 预置质谱数据快照
     # 生产环境直接挂载宿主机已有数据目录，entrypoint 检测非空则不覆盖
@@ -60,7 +58,6 @@ services:
       start_period: 60s
     networks:
       - metabobank
-
   rserve:
     image: metabank/metabospark-omics:v3.0
     restart: unless-stopped
@@ -74,7 +71,6 @@ services:
       - "${METABOBANK_DATA:-./metabobank_data}:/metabobank_data"
     networks:
       - metabobank
-
 networks:
   metabobank:
     driver: bridge
