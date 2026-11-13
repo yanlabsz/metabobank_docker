@@ -6,8 +6,9 @@
 #   bash start.sh                install & start (reuse if already installed)
 #   bash start.sh --force        recreate containers (down then up)
 #   bash start.sh --only-start   start only (images already loaded)
-#   bash start.sh --stop         stop and remove this project's containers
-#   bash start.sh --restart      restart this project
+#   bash start.sh stop           stop and remove all 3 containers (data kept)
+#   bash start.sh restart        stop then start all 3 containers (data kept)
+#   bash start.sh status         show status of the 3 containers
 #
 # Images:
 #   metabospark.tar.gz        - Web 主程序
@@ -184,8 +185,8 @@ do_start() {
     info "starting services (project: $PROJECT_NAME)..."
     compose up -d
     echo ""
-    info "waiting for services to become ready (~15s)..."
-    sleep 15
+    info "waiting for services to become healthy (up to 90s)..."
+    wait_healthy || true
     compose ps
     echo ""
     local ip
@@ -199,11 +200,40 @@ do_start() {
     info "=============================================="
 }
 
+do_status() {
+    info "container status (project: $PROJECT_NAME):"
+    compose ps
+}
+
 do_stop() {
-    info "stopping services (project: $PROJECT_NAME)..."
-    [ -f "$COMPOSE_FILE" ] || error "$COMPOSE_FILE not found"
+    info "stopping all 3 containers (project: $PROJECT_NAME) ..."
+    [ -f "$COMPOSE_FILE" ] || error "$COMPOSE_FILE not found, run 'bash start.sh' first"
     compose down
-    info "stopped"
+    # 确认 3 个服务的容器都已移除
+    local remaining
+    remaining=$(compose ps -q 2>/dev/null | wc -l)
+    if [ "$remaining" -eq 0 ]; then
+        info "all 3 containers stopped and removed (data dir untouched)"
+    else
+        warn "$remaining container(s) still present, check 'compose ps'"
+    fi
+}
+
+wait_healthy() {
+    # 等待 metabospark 健康检查通过（最多 90s），mongodb 和 rserve 跟随
+    local i
+    for i in $(seq 1 18); do
+        local state
+        state=$(docker inspect --format '{{.State.Health.Status}}' \
+                    "$(compose ps -q metabospark 2>/dev/null)" 2>/dev/null || echo "starting")
+        if [ "$state" = "healthy" ]; then
+            info "metabospark is healthy"
+            return 0
+        fi
+        sleep 5
+    done
+    warn "metabospark not healthy within 90s, run 'bash start.sh status' to check"
+    return 1
 }
 
 # --- main ------------------------------------------------------------------
@@ -211,34 +241,40 @@ main() {
     local mode="install" force="no"
     for arg in "$@"; do
         case "$arg" in
-            --force)     force="yes" ;;
-            --only-start|--stop|--restart) mode="$arg" ;;
-            *) echo "usage: bash start.sh [--force] [--only-start|--stop|--restart]"; exit 1 ;;
+            --force)                    force="yes" ;;
+            --only-start|start)         mode="start" ;;
+            --stop|stop)                mode="stop" ;;
+            --restart|restart)          mode="restart" ;;
+            --status|status)            mode="status" ;;
+            *) echo "usage: bash start.sh [--force] [start|stop|restart|status]"; exit 1 ;;
         esac
     done
 
     check_prereqs
 
-    local mine
-    mine=$(project_containers)
-    local has_mine=0
-    [ -n "$mine" ] && has_mine=1
-
     case "$mode" in
-        --stop)
+        stop)
             do_stop
             ;;
-        --restart)
+        restart)
             do_stop
             prepare_data_dir
             do_start
             ;;
-        --only-start)
-            [ -f "$COMPOSE_FILE" ] || error "--only-start needs docker-compose.yml"
+        start)
+            [ -f "$COMPOSE_FILE" ] || error "start needs docker-compose.yml; run 'bash start.sh' first"
             prepare_data_dir
             do_start
+            ;;
+        status)
+            [ -f "$COMPOSE_FILE" ] || error "status needs docker-compose.yml; run 'bash start.sh' first"
+            do_status
             ;;
         install)
+            local mine
+            mine=$(project_containers)
+            local has_mine=0
+            [ -n "$mine" ] && has_mine=1
             if [ "$has_mine" -eq 1 ]; then
                 info "found existing containers of project '$PROJECT_NAME':"
                 echo "$mine" | while read -r c; do [ -n "$c" ] && info "  - $c"; done
