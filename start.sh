@@ -1,51 +1,66 @@
 #!/bin/bash
 # ============================================================================
-# Metabobank Client - 一键部署 v4.1
+#  Metabobank - one-click installer and controller
 # ============================================================================
-# 相对 v4.0 的改动
-#   1) 下载源修正：官方 https://www.metabobank.cn/docker_download 优先，GitHub 兜底
-#   2) 新增 --local 离线模式：同目录三种 tar 包直接部署，全程不联网
-#   3) 新增 SHA256SUMS.txt 校验（--skip-checksum 跳过，MB_STRICT_SUMS=1 强制）
-#   4) 服务名/端口自动探测，不再写死 metabospark，兼容旧版 compose（web/mongodb）
-#   5) 源探测改为 1KB Range 请求，不再白下 131MB
-#   6) 覆盖已有 docker-compose.yml 前自动备份
-#   7) 下载前检查磁盘余量；docker load 失败不再 gunzip 出 8GB 临时文件
+#  WHAT THIS SCRIPT DOES
+#    Downloads (or reuses) three Docker images, loads them, creates the data
+#    directory and starts the three services Metabobank needs:
+#      - metabospark      the web application you open in a browser
+#      - mongodb5_client  the database that ships with preloaded MS data
+#      - rserve           the R analysis backend used by the web app
 #
-# Usage:
-#   bash start.sh               在线安装并启动（已装则复用现有容器）
-#   bash start.sh --local       离线安装并启动（用同目录的 tar 包，不联网）
-#   bash start.sh --force       先 down 再 up（数据目录保留）
-#   bash start.sh --only-start  只启动（镜像已 load）
-#   bash start.sh stop          停止并删除 3 个容器（数据保留）
-#   bash start.sh restart       重启 3 个容器（数据保留）
-#   bash start.sh status        查看容器状态
-#   bash start.sh logs          跟随 Web 服务日志
+#  QUICK START
+#    bash start.sh                normal install (needs internet)
+#    bash start.sh --local        offline: use the .tar.gz files in this folder
 #
-# 环境变量覆盖：
-#   METABOBANK_DATA_DIR  数据目录（默认 ./metabobank_data）
-#   METABOBANK_PORT      Web 端口（默认 8090）
-#   METABOBANK_MONGO_PORT MongoDB 映射端口（默认 27023）
-#   METABOBANK_RSERVE_PORT Rserve 端口（默认 6322，仅容器内暴露）
-#   METABOBANK_PROJECT   compose 项目名（默认取目录名）
-#   MB_STRICT_SUMS=1     没有 SHA256SUMS.txt 或校验失败时直接中止
+#  COMMON COMMANDS
+#    bash start.sh status         what is running right now
+#    bash start.sh logs           follow the web application log
+#    bash start.sh stop           stop everything (your data is kept)
+#    bash start.sh restart        stop, then start again
+#    bash start.sh --force        rebuild containers from scratch
+#    bash start.sh --only-start   just start (images are already loaded)
+#    bash start.sh --help         show this text
 #
-# 离线包目录长这样即可 bash start.sh --local：
-#   metabospark.tar.gz  mongodb5_client.tar.gz  omics.tar.gz
-#   docker-compose.yml  SHA256SUMS.txt  start.sh
+#  OPTIONS
+#    --local            never touch the network; deploy from local .tar.gz files
+#    --force            remove containers first, then start them again
+#    --only-start       skip the download/load phase entirely
+#    --skip-checksum    do not verify SHA256SUMS.txt (not recommended)
+#    --status / status  print the current state
+#    --stop / stop      shut the services down
+#    --restart          restart the services
+#    --logs / logs      follow the log of the web application
+#
+#  CUSTOM PORTS AND PATHS
+#    METABOBANK_PORT=18090 bash start.sh          web on port 18090
+#    METABOBANK_MONGO_PORT=37023 bash start.sh    database on port 37023
+#    METABOBANK_DATA_DIR=/data/metabobank bash start.sh
+#
+#  IF SOMETHING GOES WRONG
+#    1. run: bash start.sh status      (which service is not running?)
+#    2. run: bash start.sh logs        (what does the web app say?)
+#    3. if the port is taken: METABOBANK_PORT=18090 bash start.sh
+#    4. with an incomplete offline bundle: check the four files listed below
+#
+#  AN OFFLINE BUNDLE IS THIS FOLDER CONTAINING
+#    metabospark.tar.gz  mongodb5_client.tar.gz  omics.tar.gz
+#    docker-compose.yml  SHA256SUMS.txt          start.sh
 # ============================================================================
 set -eo pipefail
 
-# --- 单实例锁 --------------------------------------------------------------
+# --- one instance at a time -------------------------------------------------
 LOCK_FILE="${TMPDIR:-/tmp}/metabobank_start.lock"
 acquire_lock() {
     if command -v flock >/dev/null 2>&1; then
         exec 9>"$LOCK_FILE"
         if ! flock -n 9; then
-            echo "[ERROR] another start.sh instance is running, aborting" >&2
+            echo "" >&2
+            echo "[STOP] Another copy of start.sh is already running." >&2
+            echo "       Wait for it to finish, or check: bash start.sh status" >&2
+            echo "" >&2
             exit 1
         fi
-    else
-        echo "[WARN] flock not found, single-instance lock disabled" >&2
     fi
 }
 
@@ -55,7 +70,7 @@ SUMS_FILE="$APP_DIR/SHA256SUMS.txt"
 ENV_FILE="$APP_DIR/.env"
 
 DOWNLOAD_SOURCES=(
-    "https://www.metabobank.cn/docker_download"
+    "https://www.metabobank.cn/download"
     "https://raw.githubusercontent.com/yanlabsz/metabobank_docker/main"
 )
 IMAGE_FILES=("metabospark.tar.gz" "mongodb5_client.tar.gz" "omics.tar.gz")
@@ -67,22 +82,56 @@ META_PORT="${METABOBANK_PORT:-8090}"
 MONGO_PORT="${METABOBANK_MONGO_PORT:-27023}"
 RSERVE_PORT="${METABOBANK_RSERVE_PORT:-6322}"
 PROJECT_NAME="${METABOBANK_PROJECT:-$(basename "$APP_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')}"
-[ -z "$PROJECT_NAME" ] && PROJECT_NAME="metabobank"
+if [ -z "$PROJECT_NAME" ]; then PROJECT_NAME="metabobank"; fi
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+BOLD='\033[1m'; RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; DIM='\033[2m'; NC='\033[0m'
+info()   { echo -e "${GREEN}[OK]${NC}   $*"; }
+note()   { echo -e "       $*"; }
+warn()   { echo -e "${YELLOW}[NOTE]${NC} $*"; }
+error()  { echo ""; echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+phase()  {
+    echo ""
+    echo -e "${BOLD}------------------------------------------------------------------${NC}"
+    echo -e "${BOLD}>> $*${NC}"
+    echo -e "${BOLD}------------------------------------------------------------------${NC}"
+}
+STEP=0
+phase_step() { STEP=$((STEP + 1)); phase "Step $STEP: $*"; }
+do_this() { echo -e "       ${BOLD}What to do:${NC} $*"; }
 
-# --- 基础工具 --------------------------------------------------------------
+banner() {
+    echo ""
+    echo -e "${BOLD}==================================================================${NC}"
+    echo -e "${BOLD}  Metabobank installer${NC}"
+    echo -e "  This sets up three services: web application, database, R backend."
+    echo -e "  Nothing is deleted: your data stays in ${DIM}${DATA_DIR}${NC}"
+    echo -e "${BOLD}==================================================================${NC}"
+}
+
+# --- helpers ---------------------------------------------------------------
+# Which kind of host are we on? Linux servers are the normal case; Git Bash /
+# MSYS on Windows also works with Docker Desktop, but a few commands differ.
+HOST_KIND="linux"
+case "$(uname -s 2>/dev/null || echo Linux)" in
+    MINGW*|MSYS*|CYGWIN*) HOST_KIND="windows" ;;
+esac
+
 port_busy() {
-    if command -v ss >/dev/null 2>&1; then
-        ss -lnt 2>/dev/null | awk 'NR>1{print $4}' | grep -qE "[:.]$1\$"
+    local out=""
+    if [ "$HOST_KIND" = "windows" ]; then
+        # Windows netstat: "TCP  0.0.0.0:8090  0.0.0.0:0  LISTENING  1234"
+        out="$(netstat -ano 2>/dev/null | awk '$1=="TCP"{print $2}' || true)"
+    elif command -v ss >/dev/null 2>&1; then
+        out="$(ss -lnt 2>/dev/null | awk 'NR>1{print $4}' || true)"
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -lnt 2>/dev/null | awk 'NR>2{print $4}' | grep -qE "[:.]$1\$"
+        out="$(netstat -lnt 2>/dev/null | awk 'NR>2{print $4}' || true)"
     else
         return 1
     fi
+    if echo "$out" | grep -qE "[:.]$1\$"; then
+        return 0
+    fi
+    return 1
 }
 
 project_containers() {
@@ -91,7 +140,9 @@ project_containers() {
 }
 
 compose() {
-    # 显式 --env-file，避免 .env 只在"当前工作目录"生效的老问题
+    # --env-file is passed explicitly: a .env file is otherwise only read from
+    # the current working directory, which breaks when the script is called
+    # from somewhere else.
     if [ -f "$ENV_FILE" ]; then
         $COMPOSE_CMD --env-file "$ENV_FILE" -f "$COMPOSE_FILE" -p "$PROJECT_NAME" "$@"
     else
@@ -99,9 +150,7 @@ compose() {
     fi
 }
 
-compose_services() {
-    compose config --services 2>/dev/null || true
-}
+compose_services() { compose config --services 2>/dev/null || true; }
 
 detect_web_service() {
     if [ -f "$COMPOSE_FILE" ]; then
@@ -121,9 +170,9 @@ detect_web_service() {
 detect_host_port() {
     local cid out
     cid="$(compose ps -q "$WEB_SVC" 2>/dev/null | head -n1 || true)"
-    [ -z "$cid" ] && return 1
+    if [ -z "$cid" ]; then return 1; fi
     out="$(docker port "$cid" 2>/dev/null | head -n1 || true)"
-    [ -z "$out" ] && return 1
+    if [ -z "$out" ]; then return 1; fi
     echo "${out##*:}"
 }
 
@@ -145,37 +194,101 @@ head_len() {
 
 free_kb() { df -Pk "$APP_DIR" 2>/dev/null | awk 'NR==2{print $4}'; }
 
-# --- 前置检查 --------------------------------------------------------------
+human_size() { awk -v b="$1" 'BEGIN{ if (b >= 1073741824) printf "%.1f GB", b/1073741824; else if (b >= 1048576) printf "%.0f MB", b/1048576; else printf "%.0f KB", b/1024 }'; }
+
+# --- 1. environment --------------------------------------------------------
 check_prereqs() {
-    info "checking environment..."
-    command -v docker >/dev/null 2>&1 || error "docker not found, please install Docker 20+"
+    phase_step "checking Docker on this machine"
+
+    if ! command -v docker >/dev/null 2>&1; then
+        echo ""
+        echo -e "${RED}Docker is not installed.${NC}"
+        echo "  Metabobank runs in Docker, so Docker has to be installed first."
+        echo ""
+        echo "  CentOS / RHEL:"
+        echo "    sudo yum install -y yum-utils"
+        echo "    sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
+        echo "    sudo yum install -y docker-ce docker-compose-plugin"
+        echo "    sudo systemctl start docker && sudo systemctl enable docker"
+        echo ""
+        echo "  Ubuntu / Debian:"
+        echo "    sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2"
+        echo "    sudo systemctl start docker"
+        echo ""
+        echo "  Then run this script again."
+        exit 1
+    fi
+    note "Docker ... $(docker --version 2>/dev/null | sed 's/Docker version //; s/, build.*//')"
+
+    if ! docker info >/dev/null 2>&1; then
+        echo ""
+        echo -e "${RED}Docker is installed but not running.${NC}"
+        do_this "start it with:  sudo systemctl start docker"
+        do_this "if you are not root, add yourself to the docker group:  sudo usermod -aG docker \$USER  (then log out and back in)"
+        exit 1
+    fi
+    note "Docker daemon ... running"
+
     if docker compose version >/dev/null 2>&1; then
         COMPOSE_CMD="docker compose"
+        note "Docker Compose ... $(docker compose version 2>/dev/null | awk '{print $NF}')"
     elif command -v docker-compose >/dev/null 2>&1; then
         COMPOSE_CMD="docker-compose"
+        note "Docker Compose ... legacy docker-compose found"
     else
-        error "docker compose (v2) or docker-compose not found"
+        echo ""
+        echo -e "${RED}Docker Compose is missing.${NC}"
+        do_this "CentOS:  sudo yum install -y docker-compose-plugin"
+        do_this "Ubuntu:  sudo apt-get install -y docker-compose-v2"
+        exit 1
     fi
-    info "OK: $COMPOSE_CMD"
+
+    if [ "$(free_kb)" = "" ]; then
+        warn "Cannot read free disk space; the installer will continue anyway."
+    fi
+
+    if [ "$HOST_KIND" = "windows" ]; then
+        echo ""
+        note "Windows detected (Git Bash). Docker Desktop must be running."
+        note "  - The images are Linux images, so Docker Desktop must use the WSL 2 backend."
+        note "  - Keep the data on a Windows path, for example: METABOBANK_DATA_DIR=C:/metabobank_data"
+        note "  - If bash fails on odd lines, the file has CRLF endings: run"
+        note "    sed -i 's/\\r\$//' start.sh    and try again."
+        note "  - Windows works for testing; a Linux server or WSL 2 is recommended for real use."
+        if grep -q $'\r' "$0" 2>/dev/null; then
+            warn "start.sh currently has Windows (CRLF) line endings."
+        fi
+    fi
+    info "Docker is ready."
 }
 
+# --- 2. ports --------------------------------------------------------------
 check_ports() {
+    phase_step "checking the ports Metabobank needs"
     local p busy=0
     for p in "$META_PORT" "$MONGO_PORT"; do
         if port_busy "$p"; then
-            warn "port $p is already in use"
+            warn "Port $p is already used by another program."
             busy=1
+        else
+            note "Port $p ... free"
         fi
     done
     if [ "$busy" -eq 1 ]; then
-        warn "another service (maybe an existing Metabobank) is using these ports."
-        warn "choose different ports, for example:"
-        warn "  METABOBANK_PORT=18090 METABOBANK_MONGO_PORT=37023 bash start.sh $*"
-        error "port conflict, aborted"
+        echo ""
+        echo -e "${RED}Cannot start: the port(s) above are taken.${NC}"
+        echo "  This is often an older Metabobank installation still running."
+        echo ""
+        do_this "use different ports, for example:"
+        echo "           METABOBANK_PORT=18090 METABOBANK_MONGO_PORT=37023 bash start.sh $*"
+        do_this "or stop the old installation first:  bash start.sh stop   (in its own folder)"
+        exit 1
     fi
+    info "Both ports are available."
 }
 
 check_disk() {
+    phase_step "checking free disk space"
     local src="${1:-${DOWNLOAD_SOURCES[0]}}"
     local missing=0 i f len need_kb free
     for i in "${!IMAGE_FILES[@]}"; do
@@ -185,19 +298,33 @@ check_disk() {
             missing=$((missing + len))
         fi
     done
-    [ "$missing" -eq 0 ] && { info "all image files present, skip disk check"; return 0; }
-    # 下载 + docker load（镜像层落盘）约 2 倍
+    if [ "$missing" -eq 0 ]; then
+        note "The image files are already here, nothing to download."
+        info "Disk check skipped."
+        return 0
+    fi
+    # the download plus the images written to disk need roughly twice the size
     need_kb=$(( missing / 512 ))
     free="$(free_kb)"
-    [ -z "$free" ] && { warn "cannot read free disk space, skip check"; return 0; }
-    if [ "$free" -lt "$need_kb" ]; then
-        error "insufficient disk in $APP_DIR: need ~$((need_kb / 1048576))GB, free $((free / 1048576))GB
-  建议：腾出空间，或把 tar 包先放到别的盘再用 --local 部署"
+    if [ -z "$free" ]; then
+        warn "Cannot read free space; continuing, but watch the next step."
+        return 0
     fi
-    info "disk ok: need ~$((need_kb / 1048576))GB, free $((free / 1048576))GB"
+    note "Download size ... about $(human_size "$missing")"
+    note "Free space ... about $((free / 1048576)) GB"
+    if [ "$free" -lt "$need_kb" ]; then
+        echo ""
+        echo -e "${RED}Not enough free disk space in $APP_DIR.${NC}"
+        echo "  The download plus the loaded images need about $(human_size "$missing") twice."
+        echo ""
+        do_this "free up space (check with: df -h \"$APP_DIR\")"
+        do_this "or move the .tar.gz files to a bigger disk and run:  bash start.sh --local"
+        exit 1
+    fi
+    info "Enough disk space."
 }
 
-# --- 下载 ------------------------------------------------------------------
+# --- 4. download -----------------------------------------------------------
 fetch_file() {
     local url="$1" out="$2"
     if command -v curl >/dev/null 2>&1; then
@@ -228,24 +355,25 @@ backup_compose() {
     local bak
     bak="$COMPOSE_FILE.bak.$(date +%Y%m%d-%H%M%S)"
     cp "$COMPOSE_FILE" "$bak"
-    warn "existing docker-compose.yml backed up to $(basename "$bak")"
+    warn "A docker-compose.yml was already here; it was backed up as $(basename "$bak")"
 }
 
 download_compose() {
     local src="$1" tmp="$APP_DIR/.docker-compose.yml.new"
-    fetch_file "$src/docker-compose.yml" "$tmp" || error "failed to download docker-compose.yml"
+    fetch_file "$src/docker-compose.yml" "$tmp" || error "Could not download docker-compose.yml from $src
+       Check your network, or use an offline bundle: bash start.sh --local"
     if [ -f "$COMPOSE_FILE" ]; then
         if cmp -s "$COMPOSE_FILE" "$tmp"; then
             rm -f "$tmp"
-            info "docker-compose.yml unchanged"
+            note "docker-compose.yml ... already up to date"
         else
             backup_compose
             mv "$tmp" "$COMPOSE_FILE"
-            info "docker-compose.yml updated"
+            note "docker-compose.yml ... updated"
         fi
     else
         mv "$tmp" "$COMPOSE_FILE"
-        info "docker-compose.yml downloaded"
+        note "docker-compose.yml ... downloaded"
     fi
 }
 
@@ -253,46 +381,62 @@ download_sums() {
     local src="$1" tmp="$APP_DIR/.SHA256SUMS.new"
     if fetch_file "$src/SHA256SUMS.txt" "$tmp" 2>/dev/null; then
         mv "$tmp" "$SUMS_FILE"
-        info "SHA256SUMS.txt downloaded"
+        note "SHA256SUMS.txt ... downloaded"
     else
         rm -f "$tmp"
-        warn "SHA256SUMS.txt not available on $src"
+        warn "No SHA256SUMS.txt at $src, so the files cannot be verified."
     fi
 }
 
 download_all() {
-    local src="$1" i f sz
-    info "download source: $src"
+    local src="$1" i f sz len
+    phase_step "downloading files"
+    note "Source: $src"
+    note "This can take a while: the database image alone is about 7.6 GB."
+    echo ""
+
     download_compose "$src"
+
     for i in "${!IMAGE_FILES[@]}"; do
         f="${IMAGE_FILES[$i]}"
         if [ -s "$APP_DIR/$f" ]; then
             sz="$(du -h "$APP_DIR/$f" 2>/dev/null | awk '{print $1}')"
-            info "$f already exists (${sz:-?}), skip (delete it to force re-download)"
+            note "$f ... already here (${sz:-?}), skipping"
             continue
         fi
-        info "downloading $f (large file, please wait)..."
-        fetch_file "$src/$f" "$APP_DIR/$f" || error "failed to download $f"
+        len="$(head_len "$src/$f")"
+        if [ "$len" -gt 0 ]; then
+            note "$f ... downloading ($(human_size "$len"))"
+        else
+            note "$f ... downloading"
+        fi
+        fetch_file "$src/$f" "$APP_DIR/$f" \
+            || error "Download failed: $f
+       Check your network and run the script again; the download resumes where it stopped.
+       Or copy $f manually into $APP_DIR and run: bash start.sh --local"
     done
     download_sums "$src"
+    info "All files are in place."
 }
 
-# --- 校验 ------------------------------------------------------------------
+# --- 5. verify -------------------------------------------------------------
 verify_sums() {
+    phase_step "verifying the files"
     local i f exp act h
     if [ "$SKIP_SUMS" = "yes" ]; then
-        warn "checksum verification skipped by --skip-checksum"
+        warn "Verification skipped on request (--skip-checksum)."
         return 0
     fi
     if [ ! -s "$SUMS_FILE" ]; then
         if [ "$STRICT_SUMS" = "yes" ]; then
-            error "SHA256SUMS.txt missing, but MB_STRICT_SUMS=1"
+            error "SHA256SUMS.txt is missing, and MB_STRICT_SUMS=1 requires it.
+       Download the file again, or drop MB_STRICT_SUMS to continue unverified."
         fi
-        warn "SHA256SUMS.txt not found, skip checksum verification"
+        warn "No SHA256SUMS.txt here, so the files cannot be verified. Continuing."
         return 0
     fi
     if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
-        warn "sha256sum/shasum not found, skip checksum verification"
+        warn "This system has no sha256sum/shasum tool; verification skipped."
         return 0
     fi
     for i in "${!IMAGE_FILES[@]}"; do
@@ -301,70 +445,88 @@ verify_sums() {
         exp="$(awk -v n="$f" '{g=$2; sub(/^\.\//,"",g); sub(/^\*/,"",g); if (g==n) {print $1; exit}}' "$SUMS_FILE")"
         if [ -z "$exp" ] && [ -s "$APP_DIR/$f.sha256" ]; then
             exp="$(awk '{print $1; exit}' "$APP_DIR/$f.sha256")"
-            h="  (source: $f.sha256)"
+            h="  (from $f.sha256)"
         else
             h=""
         fi
         if [ -z "$exp" ]; then
-            warn "no checksum entry for $f"
-            [ "$STRICT_SUMS" = "yes" ] && error "no checksum entry for $f (strict mode)"
+            warn "No checksum listed for $f, skipping it."
+            if [ "$STRICT_SUMS" = "yes" ]; then
+                error "No checksum listed for $f, and strict verification is on."
+            fi
             continue
         fi
-        info "verifying $f ..."
-        act="$(sha256_file "$APP_DIR/$f")" || warn "cannot compute sha256 for $f"
+        act="$(sha256_file "$APP_DIR/$f")" || warn "Could not read $f to compute its checksum."
         if [ "$act" != "$exp" ]; then
-            error "checksum mismatch for $f
-  expected: $exp
-  actual:   $act
-  处理：删掉该文件重新下载（rm -f \"$APP_DIR/$f\"），或确认来源可信后再用 --skip-checksum"
+            echo ""
+            echo -e "${RED}The file $f is damaged or incomplete.${NC}"
+            echo "  Expected: $exp"
+            echo "  Actual:   $act"
+            echo ""
+            do_this "delete it and let the script download it again:"
+            echo "           rm -f \"$APP_DIR/$f\" && bash start.sh"
+            do_this "if you copied the file from somewhere by hand, check the source"
+            exit 1
         fi
-        info "  OK $f$h"
+        note "$f ... verified$h"
     done
+    info "Every file matches its checksum."
 }
 
-# --- 镜像 ------------------------------------------------------------------
+# --- 6. images and data ----------------------------------------------------
 load_images() {
+    phase_step "loading images into Docker"
+    note "Loading the 7.6 GB database image takes a few minutes. Please wait."
+    echo ""
     local i f ref
     for i in "${!IMAGE_FILES[@]}"; do
         f="${IMAGE_FILES[$i]}"
         ref="${IMAGE_REFS[$i]}"
         if docker image inspect "$ref" >/dev/null 2>&1; then
-            info "$ref already loaded, skip"
+            note "$ref ... already loaded, skipping"
             continue
         fi
-        [ -s "$APP_DIR/$f" ] || { warn "$f not found, skip loading $ref"; continue; }
-        info "loading image: $f"
-        docker load -i "$APP_DIR/$f" \
-            || error "docker load failed for $f（先检查磁盘余量：df -h \"$APP_DIR\"；不要解压后重试）"
+        [ -s "$APP_DIR/$f" ] || { warn "$f is not here, skipping $ref"; continue; }
+        note "$f ... loading"
+        docker load -i "$APP_DIR/$f" || error "Docker could not load $f.
+       This is usually a disk space problem. Check with:  df -h \"$APP_DIR\"
+       Do not unpack the .tar.gz by hand; just free some space and run the script again."
         if ! docker image inspect "$ref" >/dev/null 2>&1; then
-            warn "$f loaded, but image $ref not found; 包内 tag 可能与客户端预期不一致"
+            warn "$f loaded, but the image $ref was not found inside it."
         fi
     done
-    info "images ready:"
-    docker images --format '  {{.Repository}}:{{.Tag}}\t{{.Size}}' | grep -E 'metabank/' || true
+    info "Images are loaded."
 }
 
-# --- 数据目录 --------------------------------------------------------------
 prepare_data_dir() {
-    info "preparing data directory: $DATA_DIR"
-    local d
+    echo ""
+    echo -e "${BOLD}>> Preparing the data directory${NC}"
+    note "${DATA_DIR}"
+    local d data_for_compose
     for d in "${DATA_SUBDIRS[@]}"; do
         mkdir -p "$DATA_DIR/$d"
     done
-    cat > "$APP_DIR/.env" <<ENVEOF
-METABOBANK_DATA=$DATA_DIR
+    # Git Bash reports /c/Users/... which Docker Desktop cannot mount; the same
+    # folder has to be written as C:/Users/... inside .env
+    data_for_compose="$DATA_DIR"
+    if [ "$HOST_KIND" = "windows" ]; then
+        data_for_compose="$(printf '%s' "$DATA_DIR" | sed -E 's#^/([a-zA-Z])/#\U\1:/#')"
+    fi
+    cat > "$ENV_FILE" <<ENVEOF
+METABOBANK_DATA=$data_for_compose
 METABOBANK_PORT=$META_PORT
 METABOBANK_DB_PORT=$MONGO_PORT
 METABOBANK_RSERVE_PORT=$RSERVE_PORT
 ENVEOF
-    info "dbs dir: $DATA_DIR/dbs (entrypoint auto-init if empty)"
-    info ".env written"
+    note "Settings written to .env"
+    note "The database starts empty on first run and fills itself from the image."
+    info "Data directory is ready. Uploaded files and results will live here."
 }
 
 write_default_compose() {
-    warn "docker-compose.yml not found, writing built-in default (v3.0 layout)"
+    warn "No docker-compose.yml in this folder; writing the standard one."
     cat > "$COMPOSE_FILE" <<'COMPOSEEOF'
-# Metabobank Client - 内置默认部署文件（start.sh --local 生成）
+# Metabobank Client - built-in default deployment file (generated by start.sh --local)
 services:
   metabospark:
     image: metabank/metabospark:v3.0
@@ -422,113 +584,44 @@ networks:
   metabobank:
     driver: bridge
 COMPOSEEOF
-    info "built-in docker-compose.yml written"
+    note "docker-compose.yml written."
 }
 
-# --- 启动 / 停止 -----------------------------------------------------------
+# --- start / stop ----------------------------------------------------------
 wait_healthy() {
-    local i cid state hp
+    echo ""
+    note "Waiting for the web application to finish starting (usually 30-60 seconds) ..."
+    local i cid state hp dots
     for i in $(seq 1 18); do
         cid="$(compose ps -q "$WEB_SVC" 2>/dev/null | head -n1 || true)"
         if [ -n "$cid" ]; then
             state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo unknown)"
             case "$state" in
                 healthy)
-                    info "$WEB_SVC is healthy"
+                    info "The web application reports itself healthy."
                     return 0 ;;
                 none)
                     hp="$(detect_host_port || true)"
                     if [ -n "$hp" ] && curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:$hp/login" 2>/dev/null; then
-                        info "$WEB_SVC responding on :$hp (no healthcheck in image)"
+                        info "The web application answers on port $hp."
                         return 0
                     fi ;;
                 unhealthy)
-                    warn "$WEB_SVC reported unhealthy, keep waiting..." ;;
+                    warn "It reported unhealthy once; still waiting ..." ;;
             esac
         fi
+        printf '.'
         sleep 5
     done
-    warn "$WEB_SVC not healthy within 90s; run 'bash start.sh logs' to inspect"
+    echo ""
+    echo ""
+    echo -e "${YELLOW}The web application did not come up within 90 seconds.${NC}"
+    echo "  This is often a slow first start while the database imports its data."
+    echo ""
+    do_this "check the state:      bash start.sh status"
+    do_this "read the log:         bash start.sh logs"
+    do_this "wait two minutes, then open the URL below anyway; it may still start"
     return 1
-}
-
-do_start() {
-    WEB_SVC="$(detect_web_service)"
-    info "web service: $WEB_SVC"
-    info "starting services (project: $PROJECT_NAME)..."
-    compose up -d
-    echo ""
-    info "waiting for services to become healthy (up to 90s)..."
-    wait_healthy || true
-    compose ps
-    echo ""
-    local ip hp
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-    [ -z "$ip" ] && ip="127.0.0.1"
-    hp="$(detect_host_port || true)"
-    [ -z "$hp" ] && hp="$META_PORT"
-    info "=============================================="
-    info "  URL:        http://$ip:$hp"
-    info "  data dir:   $DATA_DIR"
-    info "  MongoDB:    $ip:$MONGO_PORT"
-    info "  project:    $PROJECT_NAME"
-    info "=============================================="
-}
-
-do_status() {
-    WEB_SVC="$(detect_web_service)"
-    info "container status (project: $PROJECT_NAME):"
-    compose ps
-}
-
-do_logs() {
-    WEB_SVC="$(detect_web_service)"
-    compose logs -f --tail 100 "$WEB_SVC"
-}
-
-do_stop() {
-    info "stopping all containers (project: $PROJECT_NAME) ..."
-    [ -f "$COMPOSE_FILE" ] || error "$COMPOSE_FILE not found, run 'bash start.sh' first"
-    local remaining
-    compose down
-    remaining="$(compose ps -q 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
-    if [ "${remaining:-0}" -eq 0 ]; then
-        info "all containers stopped and removed (data dir untouched)"
-    else
-        warn "$remaining container(s) still present, check 'bash start.sh status'"
-    fi
-}
-
-# --- 模式 ------------------------------------------------------------------
-do_local() {
-    local i have=0 f
-    info "local (offline) mode: using files in $APP_DIR"
-    [ -f "$COMPOSE_FILE" ] || write_default_compose
-    check_ports "--local"
-
-    for i in "${!IMAGE_REFS[@]}"; do
-        if docker image inspect "${IMAGE_REFS[$i]}" >/dev/null 2>&1; then have=1; fi
-    done
-
-    if [ "$have" -eq 1 ]; then
-        info "images already loaded, skip docker load"
-        verify_sums || true
-    else
-        local missing=0
-        for i in "${!IMAGE_FILES[@]}"; do
-            f="${IMAGE_FILES[$i]}"
-            if [ ! -s "$APP_DIR/$f" ] && ! docker image inspect "${IMAGE_REFS[$i]}" >/dev/null 2>&1; then
-                warn "missing: $f"
-                missing=1
-            fi
-        done
-        [ "$missing" -eq 1 ] && error "离线包不完整：需要 metabospark.tar.gz / mongodb5_client.tar.gz / omics.tar.gz
-  或先在本机 docker load 好 metabank/*:v3.0 镜像再运行"
-        verify_sums
-        load_images
-    fi
-    prepare_data_dir
-    do_start
 }
 
 images_all_present() {
@@ -539,31 +632,175 @@ images_all_present() {
     return 0
 }
 
+print_summary() {
+    local ip hp
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    if [ -z "$ip" ]; then ip="127.0.0.1"; fi
+    hp="$(detect_host_port || true)"
+    if [ -z "$hp" ]; then hp="$META_PORT"; fi
+    if [ "$HOST_KIND" = "windows" ]; then ip="localhost"; fi
+    echo ""
+    echo -e "${GREEN}${BOLD}==================================================================${NC}"
+    echo -e "${GREEN}${BOLD}  Metabobank is running${NC}"
+    echo -e "${GREEN}${BOLD}==================================================================${NC}"
+    echo -e "  Open it in a browser:   ${BOLD}http://$ip:$hp${NC}"
+    if [ "$HOST_KIND" = "windows" ]; then
+        echo -e "  (in Windows, localhost is what Docker Desktop publishes the port on)"
+    else
+        echo -e "  On this machine:        http://127.0.0.1:$hp"
+    fi
+    echo -e "  Data is stored in:      $DATA_DIR"
+    echo -e "  Database port:          $MONGO_PORT (only needed for external tools)"
+    echo ""
+    echo -e "  Everyday commands:"
+    echo -e "    bash start.sh status     see what is running"
+    echo -e "    bash start.sh logs       watch the web application log"
+    echo -e "    bash start.sh stop       stop it (your data stays)"
+    echo -e "    bash start.sh restart    stop and start again"
+    echo -e "    bash start.sh --local    start again without internet"
+    echo -e "${GREEN}${BOLD}==================================================================${NC}"
+    echo ""
+}
+
+do_start() {
+    WEB_SVC="$(detect_web_service)"
+    echo ""
+    echo -e "${BOLD}>> Starting the services${NC}"
+    note "web application: $WEB_SVC, database, R backend"
+    compose up -d
+    wait_healthy || true
+    echo ""
+    echo -e "${BOLD}>> Current state${NC}"
+    compose ps
+    print_summary
+}
+
+do_status() {
+    WEB_SVC="$(detect_web_service)"
+    echo ""
+    echo -e "${BOLD}>> What is running now${NC}"
+    compose ps
+    echo ""
+    local hp
+    hp="$(detect_host_port || true)"
+    if [ -n "$hp" ]; then
+        note "The web application is published on port $hp."
+    else
+        note "The web application is not publishing a port right now."
+    fi
+    note "If a service shows Exited or Restarting, read the log: bash start.sh logs"
+}
+
+do_logs() {
+    WEB_SVC="$(detect_web_service)"
+    echo ""
+    echo -e "${BOLD}>> Web application log (press Ctrl+C to stop watching)${NC}"
+    compose logs -f --tail 100 "$WEB_SVC"
+}
+
+do_stop() {
+    echo ""
+    echo -e "${BOLD}>> Stopping Metabobank${NC}"
+    [ -f "$COMPOSE_FILE" ] || error "Nothing to stop: docker-compose.yml is not in this folder.
+       Run 'bash start.sh' once, or run this from the folder where Metabobank was installed."
+    local remaining
+    compose down
+    remaining="$(compose ps -q 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
+    if [ "${remaining:-0}" -eq 0 ]; then
+        info "All three services are stopped and removed."
+        note "Your data was not touched and is still in $DATA_DIR"
+        note "Start again with: bash start.sh --only-start"
+    else
+        warn "$remaining container(s) are still there. Check with: bash start.sh status"
+    fi
+}
+
+# --- modes -----------------------------------------------------------------
+do_local() {
+    local i have=0 f
+    phase "Offline mode: installing from the files in this folder"
+    note "Folder: $APP_DIR"
+    check_ports "--local"
+
+    for i in "${!IMAGE_REFS[@]}"; do
+        if docker image inspect "${IMAGE_REFS[$i]}" >/dev/null 2>&1; then have=1; fi
+    done
+
+    if [ "$have" -eq 1 ]; then
+        echo ""
+        echo -e "${BOLD}>> The images are already in Docker${NC}"
+        note "Skipping the load step."
+        verify_sums || true
+    else
+        echo ""
+        echo -e "${BOLD}>> Looking for the three image files${NC}"
+        local missing=0
+        for i in "${!IMAGE_FILES[@]}"; do
+            f="${IMAGE_FILES[$i]}"
+            if [ -s "$APP_DIR/$f" ]; then
+                note "$f ... found ($(du -h "$APP_DIR/$f" | awk '{print $1}'))"
+            elif docker image inspect "${IMAGE_REFS[$i]}" >/dev/null 2>&1; then
+                note "$f ... not needed, image already loaded"
+            else
+                note "$f ... MISSING"
+                missing=1
+            fi
+        done
+        if [ "$missing" -eq 1 ]; then
+            echo ""
+            echo -e "${RED}The offline bundle is incomplete.${NC}"
+            echo "  Offline installation needs these three files in $APP_DIR:"
+            echo "    metabospark.tar.gz   mongodb5_client.tar.gz   omics.tar.gz"
+            echo ""
+            do_this "copy the missing files here and run: bash start.sh --local"
+            do_this "or install online instead:  bash start.sh"
+            exit 1
+        fi
+        if [ ! -f "$COMPOSE_FILE" ]; then write_default_compose; fi
+        verify_sums
+        load_images
+    fi
+    prepare_data_dir
+    do_start
+}
+
 do_install() {
     local mine has_mine=0 src
     mine="$(project_containers)"
-    [ -n "$mine" ] && has_mine=1
+    if [ -n "$mine" ]; then has_mine=1; fi
     if [ "$has_mine" -eq 1 ]; then
-        info "found existing containers of project '$PROJECT_NAME':"
-        echo "$mine" | while read -r c; do [ -n "$c" ] && info "  - $c"; done
-        info "reusing them (no download, no image load)"
+        phase "An installation already exists, starting it again"
+        note "Nothing will be downloaded and no image will be loaded."
+        echo "$mine" | while read -r c; do
+            if [ -n "$c" ]; then note "container: $c"; fi
+        done
+        prepare_data_dir
+        do_start
+        return 0
+    fi
+
+    if [ "$FORCE" = "yes" ] && [ -f "$COMPOSE_FILE" ]; then
+        do_stop
+    fi
+
+    if images_all_present && [ -f "$COMPOSE_FILE" ]; then
+        phase "Everything needed is already on this machine"
+        note "Skipping the download and load steps."
+        verify_sums || true
         prepare_data_dir
         do_start
         return 0
     fi
 
     check_ports ""
-    if [ "$FORCE" = "yes" ] && [ -f "$COMPOSE_FILE" ]; then
-        do_stop
-    fi
-    if images_all_present && [ -f "$COMPOSE_FILE" ]; then
-        info "all images already loaded and compose present, skip download"
-        verify_sums || true
-        prepare_data_dir
-        do_start
-        return 0
-    fi
-    src="$(probe_source)" || error "cannot reach https://www.metabobank.cn/docker_download nor GitHub"
+    src="$(probe_source)" || error "Cannot reach the download site.
+       Tried:  ${DOWNLOAD_SOURCES[0]}
+              ${DOWNLOAD_SOURCES[1]}
+       What to do:
+         - check this machine can open https://www.metabobank.cn/ in a browser
+         - if the machine has no internet, use an offline bundle:
+             copy the three .tar.gz files into $APP_DIR, then run: bash start.sh --local"
+
     check_disk "$src"
     download_all "$src"
     verify_sums
@@ -580,18 +817,26 @@ main() {
 
     for arg in "$@"; do
         case "$arg" in
-            --local)         mode="local" ;;
-            --force)         FORCE="yes" ;;
-            --skip-checksum) SKIP_SUMS="yes" ;;
+            --local)            mode="local" ;;
+            --force)            FORCE="yes" ;;
+            --skip-checksum)    SKIP_SUMS="yes" ;;
             --only-start|start) mode="start" ;;
-            --stop|stop)     mode="stop" ;;
-            --restart|restart) mode="restart" ;;
-            --status|status) mode="status" ;;
-            --logs|logs)     mode="logs" ;;
-            -h|--help)       sed -n '3,/^set -eo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
-            *) echo "usage: bash start.sh [--local] [--force] [--skip-checksum] [start|stop|restart|status|logs]"; exit 1 ;;
+            --stop|stop)        mode="stop" ;;
+            --restart|restart)  mode="restart" ;;
+            --status|status)    mode="status" ;;
+            --logs|logs)        mode="logs" ;;
+            -h|--help)          sed -n '3,/^set -eo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,2\}//'; exit 0 ;;
+            *) echo ""
+               echo "Unknown option: $arg"
+               echo "Run: bash start.sh --help   to see the available commands."
+               echo ""
+               exit 1 ;;
         esac
     done
+
+    if [ "$mode" = "install" ] || [ "$mode" = "local" ] || [ "$mode" = "restart" ]; then
+        banner
+    fi
 
     check_prereqs
     acquire_lock
@@ -600,13 +845,16 @@ main() {
         stop)    do_stop ;;
         restart) do_stop; prepare_data_dir; do_start ;;
         start)
-            [ -f "$COMPOSE_FILE" ] || error "start needs docker-compose.yml; run 'bash start.sh' first"
+            [ -f "$COMPOSE_FILE" ] || error "There is no docker-compose.yml in this folder yet.
+       Run 'bash start.sh' once (online) or 'bash start.sh --local' (offline)."
             prepare_data_dir; do_start ;;
         status)
-            [ -f "$COMPOSE_FILE" ] || error "status needs docker-compose.yml; run 'bash start.sh' first"
+            [ -f "$COMPOSE_FILE" ] || error "Metabobank is not installed in this folder yet.
+       Run 'bash start.sh' first."
             do_status ;;
         logs)
-            [ -f "$COMPOSE_FILE" ] || error "logs needs docker-compose.yml; run 'bash start.sh' first"
+            [ -f "$COMPOSE_FILE" ] || error "Metabobank is not installed in this folder yet.
+       Run 'bash start.sh' first."
             do_logs ;;
         install) do_install ;;
     esac
