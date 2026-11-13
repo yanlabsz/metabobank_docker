@@ -1,14 +1,25 @@
 #!/bin/bash
 # ============================================================================
-# Metabobank Client - one-click deployment (v3.3)
+# Metabobank Client - one-click deployment (v4.0)
 # ============================================================================
 # Usage:
 #   bash start.sh                install & start (reuse if already installed)
-#   bash start.sh --with-data    also download MongoDB data snapshot (~7.4G)
 #   bash start.sh --force        recreate containers (down then up)
 #   bash start.sh --only-start   start only (images already loaded)
 #   bash start.sh --stop         stop and remove this project's containers
 #   bash start.sh --restart      restart this project
+#
+# Images:
+#   metabospark.tar.gz        - Web 主程序
+#   mongodb5_client.tar.gz    - MongoDB 5.0 一体化镜像（含二进制+配置+预置质谱数据）
+#   omics.tar.gz              - 组学分析 Rserve
+#
+# Data persistence:
+#   用户数据存在 ${METABOBANK_DATA:-./metabobank_data}/dbs
+#   - 首次启动：dbs 为空时，容器 entrypoint 自动从镜像内置快照复制初始数据
+#   - 后续启动：dbs 非空则直接使用用户数据，绝不覆盖
+#   - 删镜像 / 删容器 / 升级版本：都不影响 dbs 目录里的数据
+#   - 只有手动删除 dbs 目录才会清空数据库
 #
 # Safety:
 #   * flock single-instance lock (no concurrent / duplicated execution)
@@ -33,8 +44,7 @@ DOWNLOAD_SOURCES=(
     "https://raw.githubusercontent.com/yanlabsz/metabobank_docker/main"
     "https://www.metabobank.cn/docker_download"
 )
-IMAGE_FILES=("metabospark.tar.gz" "mongodb5.tar.gz" "omics.tar.gz")
-DATA_FILE="mongodb5_data.tar.gz"
+IMAGE_FILES=("metabospark.tar.gz" "mongodb5_client.tar.gz" "omics.tar.gz")
 COMPOSE_REMOTE="docker-compose.yml"
 
 DATA_DIR="${METABOBANK_DATA_DIR:-$APP_DIR/metabobank_data}"
@@ -113,7 +123,7 @@ probe_source() {
 }
 
 download_all() {
-    local src="$1" with_data="${2:-no}"
+    local src="$1"
     info "download source: $src"
 
     info "downloading $COMPOSE_REMOTE ..."
@@ -128,18 +138,6 @@ download_all() {
         info "downloading $f (large file, please wait)..."
         fetch "$src/$f" "$APP_DIR/$f" || error "failed to download $f"
     done
-
-    if [ "$with_data" = "yes" ]; then
-        if [ -s "$APP_DIR/$DATA_FILE" ]; then
-            info "$DATA_FILE already exists, skip"
-        else
-            info "downloading data snapshot $DATA_FILE (~7.4GB)..."
-            fetch "$src/$DATA_FILE" "$APP_DIR/$DATA_FILE" || {
-                warn "data snapshot download failed, will start with an empty database"
-                rm -f "$APP_DIR/$DATA_FILE"
-            }
-        fi
-    fi
     info "download finished"
 }
 
@@ -156,7 +154,7 @@ load_images() {
         fi
     done
     info "images loaded"
-    docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' | grep -E 'metabank|^mongo:5' || true
+    docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' | grep -E 'metabank' || true
 }
 
 # --- data dir --------------------------------------------------------------
@@ -165,20 +163,10 @@ prepare_data_dir() {
     mkdir -p "$DATA_DIR/csv_upload" "$DATA_DIR/spectrum_upload" \
              "$DATA_DIR/sample_upload" "$DATA_DIR/single_upload" \
              "$DATA_DIR/tools_upload" "$DATA_DIR/download" \
-             "$DATA_DIR/compound_catche"
-
-    if [ -s "$APP_DIR/$DATA_FILE" ]; then
-        if [ -d "$DATA_DIR/dbs" ] && [ -n "$(ls -A "$DATA_DIR/dbs" 2>/dev/null)" ]; then
-            warn "$DATA_DIR/dbs already has data, skip extraction"
-        else
-            info "extracting data snapshot to $DATA_DIR ..."
-            tar xzf "$APP_DIR/$DATA_FILE" -C "$DATA_DIR"
-            info "data extracted"
-        fi
-    else
-        mkdir -p "$DATA_DIR/dbs"
-        warn "no data snapshot, starting with an empty database"
-    fi
+             "$DATA_DIR/compound_catche" "$DATA_DIR/dbs"
+    # dbs 目录的数据由 mongodb5_client 容器 entrypoint 管理：
+    # 空目录自动从镜像内置快照初始化，非空则保留用户数据
+    info "dbs dir: $DATA_DIR/dbs (entrypoint auto-init if empty)"
 
     cat > "$APP_DIR/.env" <<ENVEOF
 METABOBANK_DATA=$DATA_DIR
@@ -220,13 +208,12 @@ do_stop() {
 
 # --- main ------------------------------------------------------------------
 main() {
-    local mode="install" with_data="no" force="no"
+    local mode="install" force="no"
     for arg in "$@"; do
         case "$arg" in
-            --with-data) with_data="yes" ;;
             --force)     force="yes" ;;
             --only-start|--stop|--restart) mode="$arg" ;;
-            *) echo "usage: bash start.sh [--with-data] [--force] [--only-start|--stop|--restart]"; exit 1 ;;
+            *) echo "usage: bash start.sh [--force] [--only-start|--stop|--restart]"; exit 1 ;;
         esac
     done
 
@@ -265,7 +252,7 @@ main() {
                 fi
                 local src
                 src=$(probe_source) || error "cannot reach GitHub or the official download site"
-                download_all "$src" "$with_data"
+                download_all "$src"
                 load_images
                 prepare_data_dir
                 do_start
