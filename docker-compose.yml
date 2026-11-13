@@ -40,20 +40,21 @@ services:
       - metabobank
 
   mongodb5_client:
-    image: mongo:5.0
+    # 一体化镜像：内置 mongod5_client 二进制 + 配置 + 预置质谱数据快照
+    # 首次启动若挂载的 dbs 为空，entrypoint 自动从镜像内置快照复制初始化数据
+    image: metabank/mongodb5_client:v3.0
     restart: unless-stopped
     user: "0:0"
     ports:
       - "${METABOBANK_DB_PORT:-27023}:27023"
-    command: ["mongod", "--dbpath", "/data/db", "--port", "27023", "--bind_ip_all"]
     volumes:
-      - "${METABOBANK_DATA:-./metabobank_data}/dbs:/data/db"
+      - "${METABOBANK_DATA:-./metabobank_data}/dbs:/opt/mongodb5_client/dbs"
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet --port 27023 --eval 'db.adminCommand({ping:1})' || mongo --quiet --port 27023 --eval 'db.adminCommand({ping:1})' || exit 1"]
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/27023 && echo ok || exit 1"]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 60s
     networks:
       - metabobank
 
