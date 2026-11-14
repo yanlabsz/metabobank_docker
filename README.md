@@ -12,7 +12,7 @@ Three services start together:
 | Service | What it does | Address |
 |---|---|---|
 | `metabospark` | the web application you open in a browser | `http://<your-ip>:8090` |
-| `mongodb5_client` | the database, ships with preloaded mass-spec data | port `27023` (internal / for external tools) |
+| `mongodb5_client` | the database, ships with preloaded mass-spec data | internal only: `27023`, not published to the host |
 | `rserve` | the R backend used for omics analysis | internal only |
 
 Your uploaded files, analysis results and the database files are stored in a
@@ -49,6 +49,26 @@ sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2
 sudo systemctl enable --now docker
 ```
 
+**Docker 1.13 is not enough.** CentOS 7 ships an ancient `docker` 1.13.1 in the base
+repository, and the `docker compose` plugin mechanism only exists from Docker 19.03 on.
+If you install `docker-compose-plugin` on such a host it finishes successfully and still
+does nothing. Upgrade the engine and CLI together:
+
+```bash
+sudo yum remove -y docker docker-common docker-client || true
+sudo yum install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+sudo systemctl enable --now docker
+docker compose version      # must print v2.x
+```
+
+If you must keep the engine on 1.13, install the legacy Compose v1 instead
+(`sudo yum install -y epel-release && sudo yum install -y docker-compose`, or
+`sudo pip install docker-compose==1.29.2`).
+
+The installer accepts all three situations: `docker compose`, a standalone
+`docker-compose`, or a plugin binary found on disk and called directly
+(`/usr/libexec/docker/cli-plugins/docker-compose`).
+
 If you are not root, either run the commands with `sudo`, or add yourself to the
 `docker` group once and log in again:
 
@@ -62,23 +82,34 @@ sudo usermod -aG docker $USER
 
 ### Way A: with internet (recommended)
 
-Copy this folder to the server, then:
+You need **one file only: `start.sh`**. Everything else — `docker-compose.yml`, the three
+images and the checksum file — is fetched from `https://www.metabobank.cn/download`
+by the script itself, so there is nothing to download by hand and nothing to keep in
+sync.
 
 ```bash
-cd metabobank_deploy
 bash start.sh
 ```
+
+(If you already have the whole folder, that works too; existing files in the folder are
+reused and a different `docker-compose.yml` is backed up rather than overwritten.)
+
+**Anything already in this folder is used as it is.** If all three `.tar.gz` files are
+present, no network request is made at all — they are loaded straight from disk. If only
+some are present, the missing ones are downloaded and the existing ones skipped.
+Downloads are resumable (`curl -C -`), so an interrupted run continues where it stopped.
 
 What happens, and what you will see:
 
 1. `Step 1: checking Docker on this machine` — Docker, Compose and the daemon are checked, and the exact install command is printed if something is missing.
-2. `Step 2: checking the ports Metabobank needs` — 8090 and 27023 are checked; if another program holds them you get a ready-to-paste alternative command.
+2. `Step 2: checking the ports Metabobank needs` — only 8090 is checked, because the database port is not published to the host; if another program holds 8090 you get a ready-to-paste alternative command.
 3. `Step 3: checking free disk space` — free space is compared with the download size before anything is fetched.
-4. `Step 4: downloading files` — files come from `https://www.metabobank.cn/download`. The database image is about 7.6 GB, so this takes a while. An interrupted download resumes where it stopped if you run the script again.
+4. `Step 4: downloading files` — only the files that are not here yet; they come from `https://www.metabobank.cn/download`. The database image is about 7.6 GB, so this takes a while.
 5. `Step 5: verifying the files` — every file is compared with `SHA256SUMS.txt`; a damaged file is reported with the expected and actual checksum.
 6. `Step 6: loading images into Docker` — imports the images; several minutes for the 7.6 GB one.
 
-Offline mode shows the same phases, minus the download step.
+With the files already on disk, steps 3 and 4 disappear and the run says
+`All three image files are already in this folder`.
 
 Then it starts the services, waits for the web application to answer, and prints:
 
@@ -90,25 +121,39 @@ Then it starts the services, waits for the web application to answer, and prints
   Data is stored in:      /opt/metabobank/metabobank_data
 ```
 
-### Way B: no internet (offline bundle)
+### Way B: no internet (files copied by hand)
 
-Put these six files in **one** folder:
+Minimum is **four files** — the three images plus the script:
 
 ```
-metabospark.tar.gz        mongodb5_client.tar.gz      omics.tar.gz
-docker-compose.yml        SHA256SUMS.txt              start.sh
+metabospark.tar.gz      mongodb5_client.tar.gz      omics.tar.gz
+start.sh
 ```
 
-Then:
+Two more are optional:
+
+- `docker-compose.yml` — if it is absent, the script writes a standard one (the same
+  three services, same ports). Only provide it if you need to change ports, volumes or
+  environment variables.
+- `SHA256SUMS.txt` — without it the installer prints a warning and continues.
+  `MB_STRICT_SUMS=1` turns a missing checksum into a hard error.
+
+With all three images in the folder, a plain run is enough — it never touches the
+network:
+
+```bash
+bash start.sh
+```
+
+`--local` is only a safety switch for when you want to *guarantee* that no network
+request is attempted, for example when only some files are present and you do not want
+the script trying to fetch the rest:
 
 ```bash
 bash start.sh --local
 ```
 
-Offline mode never touches the network. If a file is missing it stops immediately
-and tells you which one. `SHA256SUMS.txt` is optional here but recommended: without
-it the installer prints a warning and continues, and `MB_STRICT_SUMS=1 bash start.sh --local`
-makes a missing checksum a hard error.
+In that mode a missing image stops the run immediately and names the file.
 
 ### First start takes longer
 
@@ -149,6 +194,67 @@ bash start.sh restart     # stop, then start again
 bash start.sh --only-start # start again quickly (images already loaded)
 bash start.sh --force     # recreate containers from scratch, data preserved
 ```
+
+### Recreating a single service
+
+When you change something that only affects one container — a port in
+`docker-compose.yml`, a variable in `.env`, a volume — you do not need to take the
+whole stack down:
+
+```bash
+bash start.sh recreate metabospark      # the web application
+bash start.sh recreate rserve           # the R backend
+bash start.sh recreate mongodb5_client  # the database
+bash start.sh recreate metabospark rserve # several at once
+bash start.sh recreate metabospark --with-deps   # also recreate what it depends on
+```
+
+To replace all three, `bash start.sh stop` followed by `bash start.sh` does it — there is
+no `--all` shortcut. Use `recreate` when containers are already running and you changed
+a port or a variable; `start.sh` alone would leave the running ones untouched.
+
+It runs, in effect:
+
+```bash
+docker compose -f docker-compose.yml -p <folder> up -d --no-deps --force-recreate <service>
+```
+
+Why those flags:
+
+| Flag | Why |
+|---|---|
+| `--force-recreate` | without it Compose decides "nothing changed" and does nothing, even after you edited a port or a variable |
+| `--no-deps` | without it Compose also recreates the services this one depends on, so recreating the web application would restart the database too |
+| no `--build` | the images are prebuilt tarballs, there is no Dockerfile on the client |
+| no `--pull` | the images are already local; a pull would only add a failure mode |
+
+The data directory and the database contents are untouched: only the named container is
+replaced. If you pass several service names, they are recreated in one go.
+
+### `.env` and the database credentials
+
+The web container does not run the application directly — the image's own `start.sh`
+starts it, and that script reads these variables:
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `METABOBANK_DB_HOST` | database address | `mongodb5_client` (compose service name) |
+| `METABOBANK_DB_PORT` | database port inside the container | `27023` |
+| `METABOBANK_DB_USER` | database account | `docker_user` |
+| `METABOBANK_DB_PASS` | database password | `docker@2026` |
+| `METABOBANK_DB_AUTH` | authentication database | `admin` |
+| `METABOBANK_SYNC_USER` / `METABOBANK_SYNC_PASS` | account used by the web application to sync | `webuser` / `passw0rd` |
+
+Two traps worth knowing:
+
+1. **`127.0.0.1` inside a container means the container itself.** To reuse a `mongod`
+   already running on the host (`127.0.0.1:27023`), switch this service to
+   `network_mode: host` or point the host at `host.docker.internal`. The default uses the
+   compose service name.
+2. When the installer writes `.env` it only rewrites the keys it manages — credentials you
+   filled in by hand are kept, and the previous file is backed up as
+   `.env.bak.<timestamp>`. Earlier versions overwrote the whole file (and your credentials
+   with it); that is fixed.
 
 ### Upgrading to a newer release
 
@@ -197,14 +303,30 @@ The setting is written to `.env` in this folder, so later commands reuse it.
 
 ## 7. Changing ports
 
-If 8090 or 27023 are already taken by another installation:
+The database port is **not** published to the host, so only the web port can clash
+with another installation:
 
 ```bash
-METABOBANK_PORT=18090 METABOBANK_MONGO_PORT=37023 bash start.sh
+METABOBANK_PORT=18090 bash start.sh
 ```
 
 The script reports the port actually published by Docker, so always trust the URL
 it prints at the end rather than the default.
+
+### If you really need to reach the database from the host
+
+For `mongosh`, Compass or a backup script running on the same server, uncomment the
+`ports` entry of `mongodb5_client` in `docker-compose.yml`:
+
+```yaml
+    # ports:
+    #   - "127.0.0.1:${METABOBANK_DB_PORT:-27023}:27023"
+```
+
+`start.sh` detects it: once the port is published again, 27023 is added back to the
+port check automatically and the final summary shows the published port. Binding it
+to `127.0.0.1:` keeps it off the network — publish it on `0.0.0.0` only if a remote
+host must connect, and remember the database has no TLS.
 
 ---
 
@@ -214,7 +336,9 @@ it prints at the end rather than the default.
 |---|---|---|
 | `Docker is not installed` | no Docker on this machine | follow the install commands printed by the script |
 | `Docker is installed but not running` | daemon stopped | `sudo systemctl start docker` |
+| `Docker Compose cannot be used` and `docker --version` shows 1.13.x | the old engine cannot load CLI plugins, so the installed plugin is silently ignored | upgrade: `sudo yum install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin && sudo systemctl restart docker`; or install legacy Compose v1 |
 | `Port 8090 is already used` | another Metabobank or other software | `METABOBANK_PORT=18090 bash start.sh`, or stop the old one |
+| `driver failed programming external connectivity ... port is already allocated` | the web port is held by another container or process; Docker reports it only after the containers are created | `docker ps --format '{{.Names}}\t{{.Ports}}'`, then `docker stop <name>`; or use another web port. The installer checks this before starting and names the owning container. (With the database port unpublished this only concerns 8090) |
 | `Not enough free disk space` | less than about 2x the download size free | free space, or move the `.tar.gz` files to a bigger disk and use `--local` |
 | `Cannot reach the download site` | no route to `www.metabobank.cn` | check with `curl -I https://www.metabobank.cn/download/`, or go offline with `--local` |
 | `The file X is damaged or incomplete` | interrupted download or bad copy | `rm -f X && bash start.sh` (download resumes/restarts cleanly) |
