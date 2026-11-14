@@ -23,8 +23,19 @@ services:
       TZ: Asia/Shanghai
       # Reach MongoDB by service name inside the compose network, which
       # overrides any 127.0.0.1 value from .env
-      METABOBANK_DB_HOST: mongodb5_client
+      # (127.0.0.1 inside a container means the container itself; to reuse a
+      #  mongod on the host, switch this service to network_mode: host)
+      METABOBANK_DB_HOST: "${METABOBANK_DB_HOST:-mongodb5_client}"
+      # container -> mongo service always uses 27023, not the published port
       METABOBANK_DB_PORT: "27023"
+      # Database credentials: the image's own start.sh reads these, so without
+      # them it cannot authenticate against an auth-enabled MongoDB
+      METABOBANK_DB_USER: "${METABOBANK_DB_USER:-docker_user}"
+      METABOBANK_DB_PASS: "${METABOBANK_DB_PASS:-docker@2026}"
+      METABOBANK_DB_AUTH: "${METABOBANK_DB_AUTH:-admin}"
+      # Account used by the web application to sync data
+      METABOBANK_SYNC_USER: "${METABOBANK_SYNC_USER:-webuser}"
+      METABOBANK_SYNC_PASS: "${METABOBANK_SYNC_PASS:-passw0rd}"
       # Omics analysis via Rserve (the legacy image listens on 6322)
       MB_RSERVE_HOST: rserve
       MB_RSERVE_PORT: "6322"
@@ -53,8 +64,13 @@ services:
     image: metabank/mongodb5_client:v3.0
     restart: unless-stopped
     user: "0:0"
-    ports:
-      - "${METABOBANK_DB_PORT:-27023}:27023"
+    # The database port is not published to the host: only the metabospark
+    # container reaches it, over the compose network, at
+    # mongodb5_client:27023. Nothing on the host needs 27023.
+    # To connect from host tools (mongosh, Compass), uncomment the two lines
+    # below; start.sh then adds 27023 back to its port check automatically.
+    # ports:
+    #   - "127.0.0.1:${METABOBANK_DB_PORT:-27023}:27023"
     volumes:
       - "${METABOBANK_DATA:-./metabobank_data}/dbs:/opt/mongodb5_client/dbs"
     healthcheck:
