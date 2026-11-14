@@ -10,20 +10,22 @@
 #      - rserve           the R analysis backend used by the web app
 #
 #  QUICK START
-#    bash start.sh                normal install (needs internet)
-#    bash start.sh --local        offline: use the .tar.gz files in this folder
+#    bash start.sh                install and start (local files are used when present)
+#    bash start.sh --local        force "no network at all" (usually not needed)
 #
 #  COMMON COMMANDS
 #    bash start.sh status         what is running right now
 #    bash start.sh logs           follow the web application log
 #    bash start.sh stop           stop everything (your data is kept)
 #    bash start.sh restart        stop, then start again
+#    bash start.sh recreate <svc> recreate one service (others keep running)
 #    bash start.sh --force        rebuild containers from scratch
 #    bash start.sh --only-start   just start (images are already loaded)
 #    bash start.sh --help         show this text
 #
 #  OPTIONS
-#    --local            never touch the network; deploy from local .tar.gz files
+#    --local            force offline: refuse to use the network at all (optional,
+#                       because files already in this folder are always used first)
 #    --force            remove containers first, then start them again
 #    --only-start       skip the download/load phase entirely
 #    --skip-checksum    do not verify SHA256SUMS.txt (not recommended)
@@ -31,11 +33,14 @@
 #    --stop / stop      shut the services down
 #    --restart          restart the services
 #    --logs / logs      follow the log of the web application
+#    --recreate <svc>   recreate the named service(s) with --no-deps --force-recreate
+#    --with-deps        with --recreate: also recreate the dependencies
 #
 #  CUSTOM PORTS AND PATHS
 #    METABOBANK_PORT=18090 bash start.sh          web on port 18090
-#    METABOBANK_MONGO_PORT=37023 bash start.sh    database on port 37023
 #    METABOBANK_DATA_DIR=/data/metabobank bash start.sh
+#  The database port is not published to the host (only the web container
+#  reaches it), so a busy 27023 on the host does not affect this install.
 #
 #  IF SOMETHING GOES WRONG
 #    1. run: bash start.sh status      (which service is not running?)
@@ -43,9 +48,15 @@
 #    3. if the port is taken: METABOBANK_PORT=18090 bash start.sh
 #    4. with an incomplete offline bundle: check the four files listed below
 #
-#  AN OFFLINE BUNDLE IS THIS FOLDER CONTAINING
+#  ONLY THIS ONE FILE IS NEEDED ONLINE
+#    start.sh downloads docker-compose.yml, the three images and the checksum
+#    file from the download site by itself. Nothing else has to be fetched by hand.
+#
+#  AN OFFLINE BUNDLE IS AT LEAST THESE FOUR FILES IN ONE FOLDER
+#    start.sh
 #    metabospark.tar.gz  mongodb5_client.tar.gz  omics.tar.gz
-#    docker-compose.yml  SHA256SUMS.txt          start.sh
+#    optional: docker-compose.yml (a standard one is written when missing)
+#              SHA256SUMS.txt     (without it the files are not verified)
 # ============================================================================
 set -eo pipefail
 
@@ -115,6 +126,56 @@ HOST_KIND="linux"
 case "$(uname -s 2>/dev/null || echo Linux)" in
     MINGW*|MSYS*|CYGWIN*) HOST_KIND="windows" ;;
 esac
+
+DOCKER_VER=""
+DOCKER_MAJOR=0
+
+record_docker_version() {
+    DOCKER_VER="$(docker --version 2>/dev/null | sed -n 's/.*version[ =]*\([0-9][0-9.]*\).*/\1/p')"
+    DOCKER_MAJOR="${DOCKER_VER%%.*}"
+    case "$DOCKER_MAJOR" in
+        ''|*[!0-9]*) DOCKER_MAJOR=0 ;;
+    esac
+}
+
+# Find a usable Compose, in three ways. The third one matters on old hosts:
+# with Docker 1.13 the CLI cannot load plugins at all, so docker-compose-plugin
+# installs fine but "docker compose" never appears. The binary itself still
+# works when called directly.
+detect_compose() {
+    COMPOSE_CMD=""
+    local p
+
+    if docker compose version >/dev/null 2>&1; then
+        COMPOSE_CMD="docker compose"
+        note "Docker Compose ... $(docker compose version 2>/dev/null | awk '{print $NF}') (plugin)"
+        return 0
+    fi
+
+    if command -v docker-compose >/dev/null 2>&1 && docker-compose version >/dev/null 2>&1; then
+        COMPOSE_CMD="docker-compose"
+        note "Docker Compose ... $(docker-compose version 2>/dev/null | head -n1)"
+        return 0
+    fi
+
+    for p in /usr/libexec/docker/cli-plugins/docker-compose \
+             /usr/local/lib/docker/cli-plugins/docker-compose \
+             /usr/lib/docker/cli-plugins/docker-compose \
+             "$HOME/.docker/cli-plugins/docker-compose"; do
+        if [ -x "$p" ] && "$p" version >/dev/null 2>&1; then
+            COMPOSE_CMD="$p"
+            note "Docker Compose ... $("$p" version 2>/dev/null | head -n1)"
+            note "  called directly from $p"
+            warn "Your docker CLI ($DOCKER_VER) cannot load plugins, so the compose binary is used directly."
+            if [ "$DOCKER_MAJOR" -lt 19 ] 2>/dev/null; then
+                warn "Compose v2 against a Docker engine this old may fail; upgrading the engine is safer."
+            fi
+            return 0
+        fi
+    done
+
+    return 1
+}
 
 port_busy() {
     local out=""
@@ -219,6 +280,7 @@ check_prereqs() {
         exit 1
     fi
     note "Docker ... $(docker --version 2>/dev/null | sed 's/Docker version //; s/, build.*//')"
+    record_docker_version
 
     if ! docker info >/dev/null 2>&1; then
         echo ""
@@ -229,18 +291,39 @@ check_prereqs() {
     fi
     note "Docker daemon ... running"
 
-    if docker compose version >/dev/null 2>&1; then
-        COMPOSE_CMD="docker compose"
-        note "Docker Compose ... $(docker compose version 2>/dev/null | awk '{print $NF}')"
-    elif command -v docker-compose >/dev/null 2>&1; then
-        COMPOSE_CMD="docker-compose"
-        note "Docker Compose ... legacy docker-compose found"
-    else
+    if ! detect_compose; then
         echo ""
-        echo -e "${RED}Docker Compose is missing.${NC}"
-        do_this "CentOS:  sudo yum install -y docker-compose-plugin"
-        do_this "Ubuntu:  sudo apt-get install -y docker-compose-v2"
+        echo -e "${RED}Docker Compose cannot be used on this machine.${NC}"
+        local doc_ver major
+        doc_ver="$(docker --version 2>/dev/null | sed -n 's/.*version[ =]*\([0-9][0-9.]*\).*/\1/p')"
+        major="${doc_ver%%.*}"
+        if [ -n "$major" ] && [ "$major" -lt 19 ] 2>/dev/null; then
+            echo "  Docker itself is too old ($doc_ver). The compose plugin needs Docker 19.03 or"
+            echo "  newer, so 'docker-compose-plugin' installs correctly but can never be used."
+            echo ""
+            do_this "upgrade the engine and CLI (CentOS 7):"
+            echo "           sudo yum remove -y docker docker-common docker-client || true"
+            echo "           sudo yum install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin"
+            echo "           sudo systemctl enable --now docker"
+            echo ""
+            do_this "or, if the engine must stay on 1.13, install the legacy Compose v1:"
+            echo "           sudo yum install -y epel-release && sudo yum install -y docker-compose"
+            echo "           (or: sudo pip install docker-compose==1.29.2)"
+            echo ""
+            echo "  After upgrading, verify with:  docker compose version"
+        else
+            echo "  The docker CLI works, but no compose binary was found."
+            echo ""
+            do_this "CentOS:  sudo yum install -y docker-compose-plugin"
+            do_this "Ubuntu:  sudo apt-get install -y docker-compose-v2"
+            do_this "legacy:  sudo pip install docker-compose==1.29.2"
+        fi
         exit 1
+    fi
+
+    if [ "$DOCKER_MAJOR" -lt 20 ] 2>/dev/null; then
+        warn "Docker $DOCKER_VER is quite old. Images saved by a newer Docker may fail to load"
+        warn "with 'docker load'. If that happens, upgrade the engine: yum install -y docker-ce docker-ce-cli containerd.io"
     fi
 
     if [ "$(free_kb)" = "" ]; then
@@ -265,8 +348,9 @@ check_prereqs() {
 # --- 2. ports --------------------------------------------------------------
 check_ports() {
     phase_step "checking the ports Metabobank needs"
-    local p busy=0
-    for p in "$META_PORT" "$MONGO_PORT"; do
+    local p busy=0 ports_to_check="$META_PORT"
+    if mongo_port_published; then ports_to_check="$META_PORT $MONGO_PORT"; fi
+    for p in $ports_to_check; do
         if port_busy "$p"; then
             warn "Port $p is already used by another program."
             busy=1
@@ -279,12 +363,12 @@ check_ports() {
         echo -e "${RED}Cannot start: the port(s) above are taken.${NC}"
         echo "  This is often an older Metabobank installation still running."
         echo ""
-        do_this "use different ports, for example:"
-        echo "           METABOBANK_PORT=18090 METABOBANK_MONGO_PORT=37023 bash start.sh $*"
+        do_this "use another web port, for example:"
+        echo "           METABOBANK_PORT=18090 bash start.sh $*"
         do_this "or stop the old installation first:  bash start.sh stop   (in its own folder)"
         exit 1
     fi
-    info "Both ports are available."
+    info "The ports it needs are available."
 }
 
 check_disk() {
@@ -498,10 +582,61 @@ load_images() {
     info "Images are loaded."
 }
 
+env_existing() {
+    local k="$1"
+    if [ ! -f "$ENV_FILE" ]; then return 1; fi
+    awk -F= -v key="$k" '$1==key {sub(/^[^=]*=/,""); print; exit}' "$ENV_FILE" | grep . || return 1
+}
+
+# Write .env: only the keys this script manages are rewritten. Everything else
+# in an existing .env is preserved, so hand-filled database credentials survive.
+write_env_file() {
+    local data_for_compose="$1"
+    local bu bp ba su sp extra bak
+    bu="$(env_existing METABOBANK_DB_USER || true)"
+    [ -z "$bu" ] && bu="${METABOBANK_DB_USER:-docker_user}"
+    bp="$(env_existing METABOBANK_DB_PASS || true)"
+    [ -z "$bp" ] && bp="${METABOBANK_DB_PASS:-docker@2026}"
+    ba="$(env_existing METABOBANK_DB_AUTH || true)"
+    [ -z "$ba" ] && ba="${METABOBANK_DB_AUTH:-admin}"
+    su="$(env_existing METABOBANK_SYNC_USER || true)"
+    [ -z "$su" ] && su="${METABOBANK_SYNC_USER:-webuser}"
+    sp="$(env_existing METABOBANK_SYNC_PASS || true)"
+    [ -z "$sp" ] && sp="${METABOBANK_SYNC_PASS:-passw0rd}"
+    extra=""
+    if [ -f "$ENV_FILE" ]; then
+        bak="$ENV_FILE.bak.$(date +%Y%m%d-%H%M%S)"
+        cp "$ENV_FILE" "$bak"
+        extra="$(grep -vE '^(METABOBANK_DATA|METABOBANK_PORT|METABOBANK_DB_PORT|METABOBANK_RSERVE_PORT|METABOBANK_DB_HOST|METABOBANK_DB_USER|METABOBANK_DB_PASS|METABOBANK_DB_AUTH|METABOBANK_SYNC_USER|METABOBANK_SYNC_PASS)=' "$ENV_FILE" || true)"
+    fi
+    {
+        echo "METABOBANK_DATA=$data_for_compose"
+        echo "METABOBANK_PORT=$META_PORT"
+        echo "METABOBANK_DB_PORT=$MONGO_PORT"
+        echo "METABOBANK_RSERVE_PORT=$RSERVE_PORT"
+        echo "METABOBANK_DB_HOST=${METABOBANK_DB_HOST:-mongodb5_client}"
+        echo "METABOBANK_DB_USER=$bu"
+        echo "METABOBANK_DB_PASS=$bp"
+        echo "METABOBANK_DB_AUTH=$ba"
+        echo "METABOBANK_SYNC_USER=$su"
+        echo "METABOBANK_SYNC_PASS=$sp"
+    } > "$ENV_FILE"
+    if [ -n "$extra" ]; then printf '%s\n' "$extra" >> "$ENV_FILE"; fi
+    if [ -n "$bak" ]; then note "The previous .env was backed up as $(basename "$bak")"; fi
+}
+
 prepare_data_dir() {
     echo ""
     echo -e "${BOLD}>> Preparing the data directory${NC}"
     note "${DATA_DIR}"
+    case "$DATA_DIR" in
+        */metabobank_data/metabobank_data*)
+            warn "The package was unpacked inside a metabobank_data folder, so the data is nested:"
+            warn "  ${DATA_DIR}"
+            warn "If you meant to reuse an existing data folder, point the installer at it:"
+            warn "  METABOBANK_DATA_DIR=${DATA_DIR%/metabobank_data} bash start.sh"
+            ;;
+    esac
     local d data_for_compose
     for d in "${DATA_SUBDIRS[@]}"; do
         mkdir -p "$DATA_DIR/$d"
@@ -512,13 +647,9 @@ prepare_data_dir() {
     if [ "$HOST_KIND" = "windows" ]; then
         data_for_compose="$(printf '%s' "$DATA_DIR" | sed -E 's#^/([a-zA-Z])/#\U\1:/#')"
     fi
-    cat > "$ENV_FILE" <<ENVEOF
-METABOBANK_DATA=$data_for_compose
-METABOBANK_PORT=$META_PORT
-METABOBANK_DB_PORT=$MONGO_PORT
-METABOBANK_RSERVE_PORT=$RSERVE_PORT
-ENVEOF
+    write_env_file "$data_for_compose"
     note "Settings written to .env"
+    note "Database credentials live in .env: METABOBANK_DB_USER / METABOBANK_DB_PASS / METABOBANK_DB_AUTH"
     note "The database starts empty on first run and fills itself from the image."
     info "Data directory is ready. Uploaded files and results will live here."
 }
@@ -535,8 +666,13 @@ services:
       - "${METABOBANK_PORT:-8090}:8090"
     environment:
       TZ: Asia/Shanghai
-      METABOBANK_DB_HOST: mongodb5_client
+      METABOBANK_DB_HOST: "${METABOBANK_DB_HOST:-mongodb5_client}"
       METABOBANK_DB_PORT: "27023"
+      METABOBANK_DB_USER: "${METABOBANK_DB_USER:-docker_user}"
+      METABOBANK_DB_PASS: "${METABOBANK_DB_PASS:-docker@2026}"
+      METABOBANK_DB_AUTH: "${METABOBANK_DB_AUTH:-admin}"
+      METABOBANK_SYNC_USER: "${METABOBANK_SYNC_USER:-webuser}"
+      METABOBANK_SYNC_PASS: "${METABOBANK_SYNC_PASS:-passw0rd}"
       MB_RSERVE_HOST: rserve
       MB_RSERVE_PORT: "6322"
       MB_RSERVE_CONNECT_TIMEOUT: "10"
@@ -558,8 +694,9 @@ services:
     image: metabank/mongodb5_client:v3.0
     restart: unless-stopped
     user: "0:0"
-    ports:
-      - "${METABOBANK_DB_PORT:-27023}:27023"
+    # database port not published to the host; only the web container reaches it
+    # ports:
+    #   - "127.0.0.1:${METABOBANK_DB_PORT:-27023}:27023"
     volumes:
       - "${METABOBANK_DATA:-./metabobank_data}/dbs:/opt/mongodb5_client/dbs"
     healthcheck:
@@ -632,6 +769,25 @@ images_all_present() {
     return 0
 }
 
+local_tarballs_present() {
+    local i f
+    for i in "${!IMAGE_FILES[@]}"; do
+        f="${IMAGE_FILES[$i]}"
+        if [ ! -s "$APP_DIR/$f" ]; then return 1; fi
+    done
+    return 0
+}
+
+# Is the database port published on the host? If you comment out the ports
+# entry of mongodb5_client, the host's 27023 is irrelevant to this install.
+mongo_port_published() {
+    local f="$COMPOSE_FILE"
+    [ -f "$f" ] || return 0
+    sed 's/#.*//' "$f" | grep -qE ':27023"' && return 0
+    sed 's/#.*//' "$f" | grep -qE ':27023$|- "27023:27023"' && return 0
+    return 1
+}
+
 print_summary() {
     local ip hp
     ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
@@ -650,16 +806,117 @@ print_summary() {
         echo -e "  On this machine:        http://127.0.0.1:$hp"
     fi
     echo -e "  Data is stored in:      $DATA_DIR"
-    echo -e "  Database port:          $MONGO_PORT (only needed for external tools)"
+    if mongo_port_published; then
+        echo -e "  Database port:          $MONGO_PORT (only needed for external tools)"
+    else
+        echo -e "  Database port:          internal 27023 only, not published to the host"
+    fi
     echo ""
     echo -e "  Everyday commands:"
     echo -e "    bash start.sh status     see what is running"
     echo -e "    bash start.sh logs       watch the web application log"
     echo -e "    bash start.sh stop       stop it (your data stays)"
     echo -e "    bash start.sh restart    stop and start again"
-    echo -e "    bash start.sh --local    start again without internet"
+    echo -e "    bash start.sh recreate <svc>   replace one service, others keep running"
     echo -e "${GREEN}${BOLD}==================================================================${NC}"
     echo ""
+}
+
+running_container_on_port() {
+    local n
+    for n in $(docker ps --format '{{.Names}}' 2>/dev/null); do
+        if docker port "$n" 2>/dev/null | grep -qE "[:.]$1\$"; then
+            echo "$n"
+            return 0
+        fi
+    done
+    return 1
+}
+
+container_project() {
+    docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$1" 2>/dev/null || true
+}
+
+container_image() {
+    docker inspect -f '{{.Config.Image}}' "$1" 2>/dev/null || true
+}
+
+# Containers made from Metabobank images that belong to some OTHER folder's
+# installation. Typical case: an older v3 deployment with fixed container names
+# (metabospark, mongodb5_client, metabospark_rserve) still running and holding
+# the ports. "compose down" here never touches them, so they have to be named.
+foreign_metabobank_containers() {
+    local n img proj
+    for n in $(docker ps --format '{{.Names}}' 2>/dev/null); do
+        img="$(container_image "$n")"
+        case "$img" in
+            *metabank/metabospark*|*metabank/mongodb5_client*|*metabank/metabospark-omics*|*metabobank*) ;;
+            *) continue ;;
+        esac
+        proj="$(container_project "$n")"
+        if [ "$proj" != "$PROJECT_NAME" ]; then
+            echo "$n"
+        fi
+    done
+}
+
+report_foreign_metabobank() {
+    local list c
+    list="$(foreign_metabobank_containers || true)"
+    if [ -z "$list" ]; then return 0; fi
+    echo ""
+    warn "These Metabobank containers are still running, and they were NOT started by this folder:"
+    for c in $list; do
+        note "  $c   image: $(container_image "$c")   ports: $(docker port "$c" 2>/dev/null | tr '\n' ' ')"
+    done
+    note "They are probably an older installation deployed from another folder."
+    do_this "stop them (their data is not touched):  docker stop $(echo "$list" | tr '\n' ' ')"
+    do_this "or start this installation on other ports instead"
+}
+
+# Before "compose up": a port held by another Docker container gives
+# "Bind for 0.0.0.0:27023 failed: port is already allocated" from the daemon,
+# which says nothing about who owns it. This names the owner first.
+prestart_port_check() {
+    local p owner proj ports_to_check="$META_PORT"
+    if mongo_port_published; then ports_to_check="$META_PORT $MONGO_PORT"; fi
+    for p in $ports_to_check; do
+        if ! port_busy "$p"; then continue; fi
+        owner="$(running_container_on_port "$p" || true)"
+        if [ -n "$owner" ]; then
+            proj="$(container_project "$owner")"
+            if [ "$proj" = "$PROJECT_NAME" ]; then
+                note "Port $p is already published by $owner, which belongs to this installation - fine."
+                continue
+            fi
+            echo ""
+            echo -e "${RED}Cannot start: port $p is taken by the Docker container \"$owner\".${NC}"
+            if [ -n "$proj" ]; then
+                echo "  That container belongs to another Docker Compose project: $proj"
+            else
+                echo "  That container was not started by Docker Compose (it has a fixed name)."
+            fi
+            case "$(container_image "$owner")" in
+                *metabank/*) echo "  Its image is $(container_image "$owner"), so this is another Metabobank instance." ;;
+            esac
+            echo ""
+            echo "  See it with:   docker ps --format '{{.Names}}\t{{.Ports}}' | grep :$p"
+            echo ""
+            do_this "stop the other container:  docker stop $owner"
+            do_this "or run this installation on another web port:"
+            echo "           METABOBANK_PORT=18090 bash start.sh"
+            exit 1
+        fi
+        echo ""
+        echo -e "${RED}Cannot start: port $p is used by a program on this machine.${NC}"
+        echo "  No Docker container publishes it, so it is an ordinary process."
+        echo ""
+        echo "  See it with:   ss -lntp | grep :$p"
+        echo ""
+        do_this "stop that program, or run this installation on another web port:"
+        echo "           METABOBANK_PORT=18090 bash start.sh"
+        exit 1
+    done
 }
 
 do_start() {
@@ -667,7 +924,21 @@ do_start() {
     echo ""
     echo -e "${BOLD}>> Starting the services${NC}"
     note "web application: $WEB_SVC, database, R backend"
-    compose up -d
+    prestart_port_check
+    if ! compose up -d; then
+        echo ""
+        echo -e "${RED}Docker refused to start one of the containers.${NC}"
+        echo "  If the message above mentions \"port is already allocated\", the port is held"
+        echo "  by another container or program. Find it with:"
+        echo "    ss -lntp | grep -E ':($META_PORT)'"
+        echo "    docker ps --format '{{.Names}}\t{{.Ports}}'"
+        echo ""
+        do_this "stop the other container, or use another web port:"
+        echo "           METABOBANK_PORT=18090 bash start.sh"
+        echo ""
+        echo "  Left-over containers from this attempt can be removed with: bash start.sh stop"
+        exit 1
+    fi
     wait_healthy || true
     echo ""
     echo -e "${BOLD}>> Current state${NC}"
@@ -707,9 +978,10 @@ do_stop() {
     compose down
     remaining="$(compose ps -q 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
     if [ "${remaining:-0}" -eq 0 ]; then
-        info "All three services are stopped and removed."
+        info "All three services of this folder are stopped and removed."
         note "Your data was not touched and is still in $DATA_DIR"
         note "Start again with: bash start.sh --only-start"
+        report_foreign_metabobank
     else
         warn "$remaining container(s) are still there. Check with: bash start.sh status"
     fi
@@ -771,6 +1043,8 @@ do_install() {
     if [ "$has_mine" -eq 1 ]; then
         phase "An installation already exists, starting it again"
         note "Nothing will be downloaded and no image will be loaded."
+        note "Running containers are reused as they are, so changed ports or settings are NOT applied here."
+        note "To apply them: bash start.sh stop  then  bash start.sh"
         echo "$mine" | while read -r c; do
             if [ -n "$c" ]; then note "container: $c"; fi
         done
@@ -783,10 +1057,24 @@ do_install() {
         do_stop
     fi
 
-    if images_all_present && [ -f "$COMPOSE_FILE" ]; then
+    if images_all_present; then
         phase "Everything needed is already on this machine"
         note "Skipping the download and load steps."
+        if [ ! -f "$COMPOSE_FILE" ]; then write_default_compose; fi
         verify_sums || true
+        prepare_data_dir
+        do_start
+        return 0
+    fi
+
+    # The three tarballs are here but the images are not loaded yet: load them
+    # from disk and never touch the network. This is why --local is optional.
+    if local_tarballs_present; then
+        phase "All three image files are already in this folder"
+        note "Nothing will be downloaded; the images are loaded from disk."
+        if [ ! -f "$COMPOSE_FILE" ]; then write_default_compose; fi
+        verify_sums || true
+        load_images
         prepare_data_dir
         do_start
         return 0
@@ -797,9 +1085,11 @@ do_install() {
        Tried:  ${DOWNLOAD_SOURCES[0]}
               ${DOWNLOAD_SOURCES[1]}
        What to do:
-         - check this machine can open https://www.metabobank.cn/ in a browser
-         - if the machine has no internet, use an offline bundle:
-             copy the three .tar.gz files into $APP_DIR, then run: bash start.sh --local"
+         - if the three .tar.gz files are already in this folder, nothing else is needed:
+             bash start.sh
+         - if some files are still missing and this machine has no internet, copy the
+           missing .tar.gz files here and run: bash start.sh --local
+         - otherwise check that the machine can open https://www.metabobank.cn/ in a browser"
 
     check_disk "$src"
     download_all "$src"
@@ -809,25 +1099,124 @@ do_install() {
     do_start
 }
 
+# --- recreate one service -------------------------------------------------
+# Why these flags:
+#   --force-recreate  without it Compose decides "nothing changed" and does
+#                     nothing, even when you edited .env or the compose file
+#   --no-deps         without it Compose also recreates the services this one
+#                     depends on, so "recreate metabospark" would restart the
+#                     database and the R backend too - needless downtime
+#   (no --build)      the images are prebuilt tarballs; there is no Dockerfile
+#   (no --pull)       the images are local; pulling would only add a failure
+do_recreate() {
+    [ -f "$COMPOSE_FILE" ] || error "Metabobank is not installed in this folder yet.
+       Run 'bash start.sh' first."
+    local svcs names s flags
+    svcs="$(compose_services)"
+    WEB_SVC="$(detect_web_service)"
+    if [ -z "$svcs" ]; then
+        error "Cannot read the service list from docker-compose.yml.
+       Check the file with: docker compose -f $COMPOSE_FILE config --services"
+    fi
+
+    if [ -z "$REBUILD_SVCS" ]; then
+        echo ""
+        echo "Which service should be recreated? Add one of these names:"
+        for s in $svcs; do
+            case "$s" in
+                *spark*) if [ "$s" = "$(detect_web_service)" ]; then echo "    $s        (the web application)"; else echo "    $s"; fi ;;
+                *mongo*) echo "    $s      (the database)" ;;
+                rserve*|*omics*) echo "    $s              (the R backend)" ;;
+                *) echo "    $s" ;;
+            esac
+        done
+        echo ""
+        echo "  bash start.sh recreate metabospark        recreate the web application"
+        echo "  bash start.sh recreate rserve             recreate the R backend"
+        echo "  bash start.sh recreate metabospark rserve recreate several at once"
+        echo "  add --with-deps to also recreate its dependencies"
+        echo ""
+        echo "To replace all three, run:  bash start.sh stop  then  bash start.sh"
+        echo ""
+        exit 1
+    fi
+
+    names="$(echo $REBUILD_SVCS)"
+
+    for s in $names; do
+        if ! echo "$svcs" | grep -qx "$s"; then
+            echo ""
+            echo -e "${RED}No service named \"$s\" in docker-compose.yml.${NC}"
+            echo "  Available services:"
+            for n in $svcs; do echo "    $n"; done
+            echo ""
+            exit 1
+        fi
+    done
+
+    flags="--force-recreate"
+    if [ "$WITH_DEPS" != "yes" ]; then
+        flags="$flags --no-deps"
+    fi
+
+    echo ""
+    echo -e "${BOLD}>> Recreating: $names${NC}"
+    if [ "$WITH_DEPS" = "yes" ]; then
+        note "dependencies are recreated as well"
+    else
+        note "dependencies (database, R backend) are left running"
+    fi
+    if ! compose up -d $flags $names; then
+        echo ""
+        echo -e "${RED}Recreating $names failed.${NC}"
+        echo "  Read the log of the affected service:  bash start.sh logs"
+        echo "  Full state:                            bash start.sh status"
+        exit 1
+    fi
+
+    case " $names " in
+        *" $WEB_SVC "*)
+            wait_healthy || true ;;
+    esac
+    echo ""
+    echo -e "${BOLD}>> Current state${NC}"
+    compose ps
+}
+
 # --- main ------------------------------------------------------------------
 main() {
     local mode="install"
     FORCE="no"; SKIP_SUMS="no"
     STRICT_SUMS="${MB_STRICT_SUMS:-no}"
+    REBUILD_SVCS=""; WITH_DEPS="no"
 
-    for arg in "$@"; do
-        case "$arg" in
-            --local)            mode="local" ;;
-            --force)            FORCE="yes" ;;
-            --skip-checksum)    SKIP_SUMS="yes" ;;
-            --only-start|start) mode="start" ;;
-            --stop|stop)        mode="stop" ;;
-            --restart|restart)  mode="restart" ;;
-            --status|status)    mode="status" ;;
-            --logs|logs)        mode="logs" ;;
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --local)            mode="local"; shift ;;
+            --force)            FORCE="yes"; shift ;;
+            --skip-checksum)    SKIP_SUMS="yes"; shift ;;
+            --only-start|start) mode="start"; shift ;;
+            --stop|stop)        mode="stop"; shift ;;
+            --restart|restart)  mode="restart"; shift ;;
+            --status|status)    mode="status"; shift ;;
+            --logs|logs)        mode="logs"; shift ;;
+            --recreate|recreate)
+                                mode="recreate"; shift
+                                while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do
+                                    REBUILD_SVCS="$REBUILD_SVCS $1"; shift
+                                done ;;
+            --all)              echo ""
+                                echo "--all is not a command here. To replace all three services:"
+                                echo "  bash start.sh stop"
+                                echo "  bash start.sh"
+                                echo "To replace one service without stopping the others:"
+                                echo "  bash start.sh recreate <service>"
+                                echo ""
+                                exit 1 ;;
+            --with-deps)        WITH_DEPS="yes"; shift ;;
             -h|--help)          sed -n '3,/^set -eo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,2\}//'; exit 0 ;;
             *) echo ""
-               echo "Unknown option: $arg"
+               echo "Unknown option: $1"
                echo "Run: bash start.sh --help   to see the available commands."
                echo ""
                exit 1 ;;
@@ -844,6 +1233,7 @@ main() {
         local)   do_local ;;
         stop)    do_stop ;;
         restart) do_stop; prepare_data_dir; do_start ;;
+        recreate) do_recreate ;;
         start)
             [ -f "$COMPOSE_FILE" ] || error "There is no docker-compose.yml in this folder yet.
        Run 'bash start.sh' once (online) or 'bash start.sh --local' (offline)."
