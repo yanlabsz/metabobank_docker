@@ -92,11 +92,28 @@ SUMS_FILE="$APP_DIR/SHA256SUMS.txt"
 ENV_FILE="$APP_DIR/.env"
 
 DOWNLOAD_SOURCES=(
+    "https://www.mbkbase.org/download/metabospark"
     "https://www.metabobank.cn/download"
-    "https://raw.githubusercontent.com/yanlabsz/metabobank_docker/main"
 )
 IMAGE_FILES=("metabospark.tar.gz" "mongodb5_client.tar.gz" "omics.tar.gz")
+IMAGE_REPOS=("metabank/metabospark" "metabank/mongodb5_client" "metabank/metabospark-omics")
 IMAGE_REFS=("metabank/metabospark:v3.0" "metabank/mongodb5_client:v3.0" "metabank/metabospark-omics:v3.0")
+
+# docker-compose.yml is the single source of truth for the image tags: a new
+# release only has to change that file. Re-read the tags before checking,
+# loading or removing images, so start.sh never looks for an outdated tag.
+# Without a compose file the defaults above are used.
+resolve_image_refs() {
+    local i repo tag
+    if [ ! -f "$COMPOSE_FILE" ]; then return 0; fi
+    for i in "${!IMAGE_REPOS[@]}"; do
+        repo="${IMAGE_REPOS[$i]}"
+        tag="$(awk -v r="$repo" '$1=="image:" && index($2, r ":")==1 {t=$2; sub(/^.*:/,"",t); print t; exit}' "$COMPOSE_FILE" 2>/dev/null)"
+        if [ -n "$tag" ]; then
+            IMAGE_REFS[$i]="$repo:$tag"
+        fi
+    done
+}
 
 DATA_DIR="${METABOBANK_DATA_DIR:-$APP_DIR/metabobank_data}"
 DATA_SUBDIRS=(csv_upload spectrum_upload sample_upload single_upload tools_upload download compound_catche dbs)
@@ -300,6 +317,7 @@ check_remote_updates() {
     local mode="${1:-ask}"
     local tmp="$APP_DIR/.SHA256SUMS.remote" have=0 base="" s
     local i f ref exp act stale=0
+    resolve_image_refs
 
     for i in "${!IMAGE_FILES[@]}"; do
         if [ -s "$APP_DIR/${IMAGE_FILES[$i]}" ]; then have=1; fi
@@ -531,14 +549,18 @@ check_disk() {
 }
 
 # --- 4. download -----------------------------------------------------------
+# Download into "<out>.part" and rename only on success. That way a file that
+# exists under its final name is always complete, and an interrupted download
+# leaves a .part file that curl -C - / wget -c can resume from on the next run.
 fetch_file() {
-    local url="$1" out="$2"
+    local url="$1" out="$2" part="$2.part"
     if command -v curl >/dev/null 2>&1; then
         curl -fL --progress-bar --connect-timeout 20 --retry 3 --retry-delay 5 \
-             -C - -o "$out" "$url"
+             -C - -o "$part" "$url" || return 1
     else
-        wget -q --show-progress -c -O "$out" "$url"
+        wget -q --show-progress -c -O "$part" "$url" || return 1
     fi
+    mv -f "$part" "$out"
 }
 
 probe_source() {
@@ -616,9 +638,13 @@ download_all() {
         else
             note "$f ... downloading"
         fi
+        if [ -s "$APP_DIR/$f.part" ]; then
+            sz="$(du -h "$APP_DIR/$f.part" 2>/dev/null | awk '{print $1}')"
+            note "$f ... resuming interrupted download (${sz:-?} already on disk)"
+        fi
         fetch_file "$src/$f" "$APP_DIR/$f" \
             || error "Download failed: $f
-       Check your network and run the script again; the download resumes where it stopped.
+       Check your network and run the script again; it resumes from $f.part.
        Or copy $f manually into $APP_DIR and run: bash start.sh --local"
     done
     download_sums "$src"
@@ -681,6 +707,7 @@ verify_sums() {
 
 # --- 6. images and data ----------------------------------------------------
 load_images() {
+    resolve_image_refs
     phase_step "loading images into Docker"
     note "Loading the 7.6 GB database image takes a few minutes. Please wait."
     echo ""
@@ -885,6 +912,7 @@ wait_healthy() {
 
 images_all_present() {
     local i
+    resolve_image_refs
     for i in "${!IMAGE_REFS[@]}"; do
         docker image inspect "${IMAGE_REFS[$i]}" >/dev/null 2>&1 || return 1
     done
@@ -1110,6 +1138,7 @@ do_stop() {
 }
 
 do_remove() {
+    resolve_image_refs
     echo ""
     echo -e "${BOLD}>> Removing Metabobank containers and images${NC}"
     note "The .tar.gz files and your data in $DATA_DIR are kept."
@@ -1150,6 +1179,7 @@ do_remove() {
 # --- modes -----------------------------------------------------------------
 do_local() {
     local i have=0 f
+    resolve_image_refs
     phase "Offline mode: installing from the files in this folder"
     note "Folder: $APP_DIR"
     check_ports "--local"
