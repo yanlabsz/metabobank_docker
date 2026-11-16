@@ -21,6 +21,7 @@
 #    bash start.sh recreate <svc> recreate one service (others keep running)
 #    bash start.sh --force        rebuild containers from scratch
 #    bash start.sh --only-start   just start (images are already loaded)
+#    bash start.sh --remove       stop everything and delete the three images
 #    bash start.sh --help         show this text
 #
 #  OPTIONS
@@ -28,6 +29,8 @@
 #                       because files already in this folder are always used first)
 #    --force            remove containers first, then start them again
 #    --only-start       skip the download/load phase entirely
+#    --remove           stop the services and delete the three Docker images
+#                       (your data in the data folder and the .tar.gz files are kept)
 #    --skip-checksum    do not verify SHA256SUMS.txt (not recommended)
 #    --status / status  print the current state
 #    --stop / stop      shut the services down
@@ -35,6 +38,14 @@
 #    --logs / logs      follow the log of the web application
 #    --recreate <svc>   recreate the named service(s) with --no-deps --force-recreate
 #    --with-deps        with --recreate: also recreate the dependencies
+#
+#  IMAGE UPDATES (online mode)
+#    When the .tar.gz files are already in this folder, start.sh compares their
+#    SHA256 with SHA256SUMS.txt on the download site. If a newer file has been
+#    published it asks whether to download it, then removes the old image so the
+#    new one can be loaded. When Metabobank is already running the update is only
+#    reported (stop it first with --remove to install the new version). Without a
+#    terminal the local files are kept and nothing is downloaded.
 #
 #  CUSTOM PORTS AND PATHS
 #    METABOBANK_PORT=18090 bash start.sh          web on port 18090
@@ -245,6 +256,117 @@ sha256_file() {
     else
         return 1
     fi
+}
+
+sum_of_file() {
+    awk -v n="$2" '{g=$2; sub(/^\.\//,"",g); sub(/^\*/,"",g); if (g==n) {print $1; exit}}' "$1"
+}
+
+# Ask a yes/no question. In a non-interactive session (cron, pipeline) the
+# answer is "no", so an unattended run never deletes or downloads anything.
+ask_yes_no() {
+    local prompt="$1" ans=""
+    if ( : </dev/tty ) 2>/dev/null; then
+        printf '%s [y/N] ' "$prompt" >/dev/tty
+        read -r ans </dev/tty || ans=""
+    elif [ -t 0 ]; then
+        printf '%s [y/N] ' "$prompt"
+        read -r ans || ans=""
+    else
+        note "$prompt -> no (no terminal)"
+        return 1
+    fi
+    case "$ans" in
+        y|Y|yes|YES|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+fetch_remote_sums() {
+    local base="$1" out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 5 --max-time 12 -o "$out" "$base/SHA256SUMS.txt" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 12 -t 1 -O "$out" "$base/SHA256SUMS.txt" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# Compare the image files already in this folder with the checksum list on the
+# download site. When a newer file was published, ask the user whether to
+# re-download it, and remove the matching image so the new one gets loaded.
+check_remote_updates() {
+    local mode="${1:-ask}"
+    local tmp="$APP_DIR/.SHA256SUMS.remote" have=0 base="" s
+    local i f ref exp act stale=0
+
+    for i in "${!IMAGE_FILES[@]}"; do
+        if [ -s "$APP_DIR/${IMAGE_FILES[$i]}" ]; then have=1; fi
+    done
+    if [ "$have" -eq 0 ]; then return 0; fi
+
+    phase_step "checking for updated image files"
+    for s in "${DOWNLOAD_SOURCES[@]}"; do
+        if fetch_remote_sums "$s" "$tmp"; then base="$s"; break; fi
+    done
+    if [ -z "$base" ]; then
+        rm -f "$tmp"
+        note "No checksum list online; skipping the update check."
+        return 0
+    fi
+
+    for i in "${!IMAGE_FILES[@]}"; do
+        f="${IMAGE_FILES[$i]}"
+        if [ ! -s "$APP_DIR/$f" ]; then continue; fi
+        exp="$(sum_of_file "$tmp" "$f")"
+        if [ -z "$exp" ]; then continue; fi
+        act="$(sha256_file "$APP_DIR/$f")" || continue
+        if [ "$act" != "$exp" ]; then
+            stale=$((stale + 1))
+            note "$f ... a newer version is available online"
+        fi
+    done
+
+    if [ "$stale" -eq 0 ]; then
+        mv -f "$tmp" "$SUMS_FILE"
+        info "The image files on this machine are up to date."
+        return 0
+    fi
+
+    if [ "$mode" = "inform" ]; then
+        rm -f "$tmp"
+        warn "$stale image file(s) have a newer version online."
+        note "The running installation keeps using the images already loaded."
+        note "To update: bash start.sh --remove   then   bash start.sh"
+        return 0
+    fi
+
+    if ! ask_yes_no "$stale image file(s) have a newer version online. Download them now?"; then
+        rm -f "$tmp"
+        warn "Keeping the local image files; the update was skipped."
+        note "To update later: bash start.sh --remove   then   bash start.sh"
+        return 0
+    fi
+
+    for i in "${!IMAGE_FILES[@]}"; do
+        f="${IMAGE_FILES[$i]}"
+        ref="${IMAGE_REFS[$i]}"
+        if [ ! -s "$APP_DIR/$f" ]; then continue; fi
+        exp="$(sum_of_file "$tmp" "$f")"
+        if [ -z "$exp" ]; then continue; fi
+        act="$(sha256_file "$APP_DIR/$f")" || continue
+        if [ "$act" != "$exp" ]; then
+            rm -f "$APP_DIR/$f"
+            note "$f ... removed, it will be downloaded again"
+            if docker image inspect "$ref" >/dev/null 2>&1; then
+                docker rmi "$ref" >/dev/null 2>&1 || true
+                note "$ref ... image removed so the new one can be loaded"
+            fi
+        fi
+    done
+    mv -f "$tmp" "$SUMS_FILE"
+    info "The updated files will be downloaded in the next step."
 }
 
 head_len() {
@@ -987,6 +1109,44 @@ do_stop() {
     fi
 }
 
+do_remove() {
+    echo ""
+    echo -e "${BOLD}>> Removing Metabobank containers and images${NC}"
+    note "The .tar.gz files and your data in $DATA_DIR are kept."
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        compose down --remove-orphans || warn "docker compose down reported a problem; continuing."
+    else
+        local cs
+        cs="$(project_containers)"
+        if [ -n "$cs" ]; then
+            docker rm -f $cs >/dev/null 2>&1 || true
+            note "Containers removed: $(echo $cs)"
+        else
+            note "No container of this folder was found."
+        fi
+    fi
+
+    local i ref removed=0
+    for i in "${!IMAGE_REFS[@]}"; do
+        ref="${IMAGE_REFS[$i]}"
+        if docker image inspect "$ref" >/dev/null 2>&1; then
+            if docker rmi "$ref" >/dev/null 2>&1; then
+                note "$ref ... removed"
+                removed=$((removed + 1))
+            else
+                warn "$ref ... could not be removed (it is still in use by another container)"
+            fi
+        else
+            note "$ref ... not present"
+        fi
+    done
+
+    echo ""
+    info "Containers stopped, $removed image(s) removed."
+    note "Install again with: bash start.sh"
+}
+
 # --- modes -----------------------------------------------------------------
 do_local() {
     local i have=0 f
@@ -1041,6 +1201,7 @@ do_install() {
     mine="$(project_containers)"
     if [ -n "$mine" ]; then has_mine=1; fi
     if [ "$has_mine" -eq 1 ]; then
+        check_remote_updates inform
         phase "An installation already exists, starting it again"
         note "Nothing will be downloaded and no image will be loaded."
         note "Running containers are reused as they are, so changed ports or settings are NOT applied here."
@@ -1056,6 +1217,10 @@ do_install() {
     if [ "$FORCE" = "yes" ] && [ -f "$COMPOSE_FILE" ]; then
         do_stop
     fi
+
+    # Online mode: compare the image files in this folder with the checksum list
+    # on the download site and offer to fetch newer versions before starting.
+    check_remote_updates
 
     if images_all_present; then
         phase "Everything needed is already on this machine"
@@ -1196,6 +1361,7 @@ main() {
             --force)            FORCE="yes"; shift ;;
             --skip-checksum)    SKIP_SUMS="yes"; shift ;;
             --only-start|start) mode="start"; shift ;;
+            --remove)           mode="remove"; shift ;;
             --stop|stop)        mode="stop"; shift ;;
             --restart|restart)  mode="restart"; shift ;;
             --status|status)    mode="status"; shift ;;
@@ -1231,6 +1397,7 @@ main() {
     acquire_lock
     case "$mode" in
         local)   do_local ;;
+        remove)  do_remove ;;
         stop)    do_stop ;;
         restart) do_stop; prepare_data_dir; do_start ;;
         recreate) do_recreate ;;
